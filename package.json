@@ -1,15 +1,19 @@
 {
-  "name": "nodejs",
+  "name": "linqbridge",
   "version": "1.0.0",
-  "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "worker": "node worker.js",
+    "playwright:install": "npx playwright install firefox"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@types/node": "^22.13.11"
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^12.2.0",
+    "cors": "^2.8.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "playwright": "^1.54.2"
   }
 }

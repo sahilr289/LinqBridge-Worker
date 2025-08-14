@@ -376,12 +376,9 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
 const processors = {
   async SEND_CONNECTION(job) {
     const { profileUrl, note, cookieBundle } = job.payload || {};
-    const li_at = cookieBundle?.li_at || job.payload?.li_at;
-    const jsessionid = cookieBundle?.JSESSIONID || job.payload?.jsessionid;
-    const bcookie = cookieBundle?.bcookie || job.payload?.bcookie;
+    const { li_at, jsessionid, bcookie } = cookieBundle || {};
     console.log('[job] SEND_CONNECTION start', { hasCookie: !!li_at, hasJsession: !!jsessionid, hasBcookie: !!bcookie, profileUrl });
 
-    // 90s total guard for the whole run
     const result = await withWatchdog(
       sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }),
       90_000,

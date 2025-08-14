@@ -77,6 +77,36 @@ app.post('/jobs/:id/complete', (req, res) => {
   res.json({ success: true });
 });
 
+// Mark job as failed
+app.post('/jobs/:id/fail', (req, res) => {
+  const workerSecret = req.headers['x-worker-secret'];
+  
+  if (workerSecret !== WORKER_SHARED_SECRET) {
+    return res.status(401).json({ success: false, message: 'Invalid worker secret' });
+  }
+  
+  const jobId = parseInt(req.params.id);
+  const job = jobs.find(j => j.id === jobId);
+  const { error, requeue = false, delayMs = 0 } = req.body;
+  
+  if (job) {
+    if (requeue) {
+      job.status = 'pending';
+      job.attempts = (job.attempts || 0) + 1;
+      job.lastError = error;
+      job.nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+      console.log(`Job ${jobId} failed, requeued for retry in ${delayMs}ms`);
+    } else {
+      job.status = 'failed';
+      job.failedAt = new Date().toISOString();
+      job.error = error;
+      console.log(`Job ${jobId} failed permanently:`, error);
+    }
+  }
+  
+  res.json({ success: true });
+});
+
 // Get job status
 app.get('/jobs/:id', (req, res) => {
   const jobId = parseInt(req.params.id);

@@ -1,19 +1,39 @@
+
 const { firefox } = require('playwright');
 const axios = require('axios');
 
-const API_BASE = process.env.SERVER_BASE_URL || process.env.API_BASE || 'http://localhost:5000';
-const USER_EMAIL = process.env.USER_EMAIL;
-const USER_PASSWORD = process.env.USER_PASSWORD;
-const DAILY_CAP = parseInt(process.env.DAILY_CAP || '40', 10);
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL;
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 
-// Quick sanity check
-try {
-  const host = new URL(API_BASE).host;
-  console.log('SERVER host:', host, '| secret set:', !!WORKER_SHARED_SECRET);
-} catch {
-  console.log('SERVER_BASE_URL is invalid or missing');
+if (!SERVER_BASE_URL || !WORKER_SHARED_SECRET) {
+  console.error('Set SERVER_BASE_URL and WORKER_SHARED_SECRET in Replit Secrets.');
+  process.exit(1);
+}
+
+// Queue HTTP helpers
+async function fetchNextJob() {
+  const r = await axios.post(`${SERVER_BASE_URL}/jobs/next`, {}, { 
+    headers: { 'x-worker-secret': WORKER_SHARED_SECRET },
+    timeout: 10000
+  });
+  return r.data?.job || null;
+}
+
+async function completeJob(id, result) {
+  await axios.post(`${SERVER_BASE_URL}/jobs/${id}/complete`, { result }, { 
+    headers: { 'x-worker-secret': WORKER_SHARED_SECRET }
+  });
+}
+
+async function failJob(id, errorMessage, { requeue=false, delayMs=0 }={}) {
+  await axios.post(`${SERVER_BASE_URL}/jobs/${id}/fail`, { 
+    error: String(errorMessage||'Unknown'), 
+    requeue, 
+    delayMs 
+  }, { 
+    headers: { 'x-worker-secret': WORKER_SHARED_SECRET }
+  });
 }
 
 function jitter(min, max) {
@@ -32,48 +52,6 @@ async function launchFirefox() {
       '--disable-renderer-backgrounding'
     ]
   });
-}
-
-async function runOnce() {
-  console.log('tick at', new Date().toISOString());
-  
-  try {
-    // Fetch next job
-    const response = await axios.post(`${API_BASE}/jobs/next`, {}, {
-      headers: {
-        'x-worker-secret': WORKER_SHARED_SECRET,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    });
-
-    const { job } = response.data;
-    if (!job) {
-      console.log('No jobs available');
-      return;
-    }
-
-    console.log(`Processing job ${job.id}: ${job.type}`);
-
-    if (job.type === 'SEND_CONNECTION') {
-      const result = await sendConnection(job.payload);
-      console.log(`✅ SEND_CONNECTION ${job.id} completed:`, result);
-    }
-
-    // Mark job as completed
-    await axios.post(`${API_BASE}/jobs/${job.id}/complete`, {
-      status: 'completed',
-      result: 'success'
-    }, {
-      headers: {
-        'x-worker-secret': WORKER_SHARED_SECRET,
-        'Content-Type': 'application/json'
-      }
-    });
-
-  } catch (error) {
-    console.error('Worker error:', error.message);
-  }
 }
 
 async function sendConnection({ profileUrl, note, li_at }) {
@@ -142,7 +120,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
   // Try to find Connect (direct OR inside "More" menu)
   let connectClicked = false;
 
-  // Try direct “Connect”
+  // Try direct "Connect"
   const connectCandidates = [
     () => page.getByRole("button", { name: /connect/i }).first(),
     () => page.locator('button:has-text("Connect")').first(),
@@ -162,7 +140,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
     }
   }
 
-  // If not found, open “More” menu → “Connect”
+  // If not found, open "More" menu → "Connect"
   if (!connectClicked) {
     const moreBtn = page
       .getByRole("button", { name: /^more( actions)?$/i })
@@ -214,7 +192,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
 
   await page.waitForTimeout(jitter(400, 900));
 
-  // If note was requested, try “Add a note” path first.
+  // If note was requested, try "Add a note" path first.
   if (note) {
     try {
       const addNoteBtn = page
@@ -227,7 +205,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
     } catch {}
   }
 
-  // Possible “Send” buttons (LinkedIn has many variants)
+  // Possible "Send" buttons (LinkedIn has many variants)
   const sendCandidates = [
     () => page.getByRole("button", { name: /^send$/i }).first(),
     () => page.getByRole("button", { name: /send without a note/i }).first(),
@@ -263,7 +241,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
     }
   }
 
-  // Some flows use “Done”
+  // Some flows use "Done"
   if (!sent) {
     const doneBtn = page.getByRole("button", { name: /^done$/i }).first();
     if (await doneBtn.count()) {
@@ -329,21 +307,56 @@ async function sendConnection({ profileUrl, note, li_at }) {
   };
 }
 
-// --- boot the poller ---
-(async () => {
-  console.log(`Worker started. Polling every ${POLL_INTERVAL_MS} ms`);
-  // fire once immediately so you see logs even if no interval yet
-  try { 
-    await runOnce(); 
-  } catch (e) { 
-    console.error('runOnce immediate error:', e.message); 
+// Processors
+const processors = {
+  async SEND_CONNECTION(job) {
+    const { profileUrl, note, cookieBundle } = job.payload || {};
+    const li_at = cookieBundle?.li_at || job.payload?.li_at;
+    const result = await sendConnection({ profileUrl, note, li_at });
+    return result;
+  }
+};
+
+async function runOnce() {
+  const job = await fetchNextJob();
+  if (!job) { 
+    console.log('No jobs available'); 
+    return; 
   }
 
-  setInterval(async () => {
-    try {
-      await runOnce();
-    } catch (e) {
-      console.error('runOnce error:', e.message);
-    }
-  }, POLL_INTERVAL_MS);
+  console.log(`Processing job ${job.id}: ${job.type}`);
+  const handler = processors[job.type];
+  if (!handler) { 
+    await failJob(job.id, `No processor for ${job.type}`); 
+    return; 
+  }
+
+  try {
+    const result = await handler(job);
+    console.log(`✅ ${job.type} ${job.id} completed:`, result);
+    await completeJob(job.id, result);
+  } catch (e) {
+    console.error('Worker error:', e.message);
+    const transient = /timeout|navigation|rate limit|temporary|network/i.test(e.message||'');
+    await failJob(job.id, e.message, { 
+      requeue: transient, 
+      delayMs: transient ? 15000 : 0 
+    });
+  }
+}
+
+// Boot the poller
+(async () => {
+  const host = new URL(SERVER_BASE_URL).host;
+  console.log('SERVER host:', host, '| secret set:', !!WORKER_SHARED_SECRET);
+  console.log(`Worker started. Polling every ${POLL_INTERVAL_MS} ms`);
+  
+  const tick = () => console.log('tick at', new Date().toISOString());
+  const loop = async () => { 
+    tick(); 
+    await runOnce().catch(e => console.error('runOnce error:', e.message)); 
+  };
+  
+  await loop();
+  setInterval(loop, POLL_INTERVAL_MS);
 })();

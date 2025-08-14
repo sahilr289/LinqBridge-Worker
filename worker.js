@@ -40,6 +40,79 @@ function jitter(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function normalizeSpace(s) {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Find and click the Connect action using the precise selectors you provided.
+ * Returns true if we clicked something that should open the invite flow or send directly.
+ */
+async function clickConnect(page) {
+  // Ensure desktop layout & top card in view
+  await page.setViewportSize({ width: 1366, height: 850 }).catch(()=>{});
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' })).catch(()=>{});
+  await page.waitForTimeout(400);
+
+  // 1) Exact aria-label pattern: "Invite <Name> to connect"
+  const inviteBtn = page.locator('button[aria-label$=" to connect"]'); // ends with " to connect"
+  if (await inviteBtn.count()) {
+    try {
+      // Guard against false positives by checking visible text contains "Connect"
+      const first = inviteBtn.first();
+      const txt = normalizeSpace(await first.innerText().catch(()=>''));      
+      if (/connect/i.test(txt)) {
+        await first.scrollIntoViewIfNeeded();
+        await first.click({ delay: 60 });
+        console.log('[Connect] clicked aria-label "... to connect" button');
+        return true;
+      }
+    } catch {}
+  }
+
+  // 2) Primary Connect button on the top card
+  const primaryConnect = page.locator([
+    // Top-card contextual primary button that says Connect
+    'section[data-view-name*="ProfileTopCard"] button.artdeco-button--primary:has-text("Connect")',
+    // or any primary connect button visible on the page
+    'button.artdeco-button--primary:has-text("Connect")'
+  ].join(', ')).first();
+
+  if (await primaryConnect.count()) {
+    try {
+      await primaryConnect.scrollIntoViewIfNeeded();
+      await primaryConnect.click({ delay: 60 });
+      console.log('[Connect] clicked primary Connect button');
+      return true;
+    } catch {}
+  }
+
+  // 3) "More actions" → menu item "Connect"
+  const moreBtn = page.locator([
+    'button[aria-label="More actions"]',
+    'button[aria-label*="More" i]',
+    'button.artdeco-dropdown__trigger[aria-haspopup="menu"]'
+  ].join(', ')).first();
+
+  if (await moreBtn.count()) {
+    try {
+      await moreBtn.scrollIntoViewIfNeeded();
+      await moreBtn.click({ delay: 60 });
+      await page.waitForTimeout(300);
+
+      // menuitem that contains "Connect"
+      const menuConnect = page.locator('[role="menuitem"]:has-text("Connect"), [role="menuitemcheckbox"]:has-text("Connect")').first();
+      if (await menuConnect.count()) {
+        await menuConnect.click({ delay: 60 });
+        console.log('[Connect] clicked More → Connect');
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
 async function launchFirefox() {
   return await firefox.launch({
     headless: true,
@@ -117,54 +190,17 @@ async function sendConnection({ profileUrl, note, li_at }) {
     return { alreadyConnected: alreadyMsg, pending };
   }
 
-  // Try to find Connect (direct OR inside "More" menu)
-  let connectClicked = false;
+  // Wake UI a bit
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(350);
 
-  // Try direct "Connect"
-  const connectCandidates = [
-    () => page.getByRole("button", { name: /connect/i }).first(),
-    () => page.locator('button:has-text("Connect")').first(),
-    () => page.locator('div[role="button"]:has-text("Connect")').first(),
-    () => page.locator('button:has(span:has-text("Connect"))').first(),
-  ];
-
-  for (const fn of connectCandidates) {
-    const btn = fn();
-    if (await btn.count()) {
-      try {
-        await btn.scrollIntoViewIfNeeded();
-        await btn.click({ delay: jitter(40, 120) });
-        connectClicked = true;
-        break;
-      } catch {}
-    }
-  }
-
-  // If not found, open "More" menu → "Connect"
-  if (!connectClicked) {
-    const moreBtn = page
-      .getByRole("button", { name: /^more( actions)?$/i })
-      .first();
-    if (await moreBtn.count()) {
-      try {
-        await moreBtn.click({ delay: jitter(40, 120) });
-        await page.waitForTimeout(jitter(300, 700));
-        const menuConnect = page
-          .locator('div[role="menuitem"]:has-text("Connect")')
-          .first();
-        if (await menuConnect.count()) {
-          await menuConnect.click({ delay: jitter(40, 120) });
-          connectClicked = true;
-        }
-      } catch {}
-    }
-  }
-
-  if (!connectClicked) {
+  // CLICK CONNECT using exact selectors and fallbacks
+  const clicked = await clickConnect(page);
+  if (!clicked) {
     await snap("no_connect_button");
     await ctx.close();
     await browser.close();
-    throw new Error("Connect button not found (direct or via More)");
+    throw new Error('Connect button not found with exact selectors (aria-label "... to connect", primary Connect, or More → Connect)');
   }
 
   // After clicking Connect, a modal may or may not appear.

@@ -1,26 +1,37 @@
+
 { pkgs }: {
   deps = [
-    pkgs.nodejs-16_x
-    pkgs.nodePackages.typescript-language-server
-    pkgs.yarn
-    pkgs.replitPackages.jest
-    pkgs.cairo
-    pkgs.pango
-    pkgs.libxcb
+    pkgs.nodejs_22
+
+    # X11 + GL stack
     pkgs.xorg.libX11
-    pkgs.xorg.libXext
-    pkgs.xorg.libXrandr
     pkgs.xorg.libXcomposite
-    pkgs.xorg.libXcursor
     pkgs.xorg.libXdamage
+    pkgs.xorg.libXext
     pkgs.xorg.libXfixes
-    pkgs.xorg.libXi
+    pkgs.xorg.libXrandr
     pkgs.xorg.libXrender
+    pkgs.xorg.libxcb
+    pkgs.libxkbcommon
+    pkgs.libdrm
+    pkgs.mesa
+    pkgs.pciutils  # fixes "libpci missing" in glxtest logs
+
+    # GTK / UI deps
     pkgs.gtk3
-    pkgs.gdk-pixbuf
     pkgs.glib
-    pkgs.alsa-lib
+    pkgs.gdk-pixbuf
+    pkgs.pango
+    pkgs.cairo
+    pkgs.at-spi2-core
     pkgs.dbus
-    pkgs.atk
+    pkgs.cups
+
+    # NSS/NSPR (certs, crypto)
+    pkgs.nss
+    pkgs.nspr
+
+    # Audio (Playwright checks this even headless)
+    pkgs.alsa-lib
   ];
 }

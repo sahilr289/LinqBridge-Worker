@@ -1,25 +1,14 @@
-// worker.js — LinqBridge connection sender (Playwright + Firefox)
 
-// Run with: npm run worker
-// Env vars required (Replit Secrets):
-//   API_BASE       -> e.g. https://<your>-pike.replit.dev:5000   (use the exact URL that works in your extension)
-//   USER_EMAIL     -> your BDR login (same one you use for /login)
-//   USER_PASSWORD  -> that user's password
-//   DAILY_CAP      -> optional (default 40)
+// worker.js — Playwright runner for connection sending (Firefox)
 
 const { firefox } = require('playwright');
-
-// Node 22 has global fetch; if your runtime doesn't, uncomment:
-// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const API_BASE      = process.env.API_BASE || 'http://localhost:5000';
 const USER_EMAIL    = process.env.USER_EMAIL;
 const USER_PASSWORD = process.env.USER_PASSWORD;
 const DAILY_CAP     = parseInt(process.env.DAILY_CAP || '40', 10);
 
-// Gentle human timing
 const SLEEP_BETWEEN_MS = { min: 35_000, max: 90_000 };
-
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function jitter(min, max){ return Math.floor(Math.random()*(max-min+1))+min; }
 
@@ -29,10 +18,8 @@ async function getJWT() {
     headers: { 'Content-Type':'application/json' },
     body: JSON.stringify({ email: USER_EMAIL, password: USER_PASSWORD })
   });
-  const j = await r.json().catch(()=> ({}));
-  if (!r.ok || !j.success || !j.token) {
-    throw new Error('JWT login failed: ' + (j.message || r.status));
-  }
+  const j = await r.json();
+  if (!r.ok || !j.success || !j.token) throw new Error('JWT login failed: ' + (j.message || r.status));
   return j.token;
 }
 
@@ -40,10 +27,8 @@ async function getLiAt(token) {
   const r = await fetch(`${API_BASE}/api/me/liat`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
-  const j = await r.json().catch(()=> ({}));
-  if (!r.ok || !j.success || !j.li_at) {
-    throw new Error('No li_at stored for this user. Capture cookies via extension first.');
-  }
+  const j = await r.json();
+  if (!r.ok || !j.success || !j.li_at) throw new Error('No li_at stored for this user.');
   return j.li_at;
 }
 
@@ -51,173 +36,122 @@ async function getNextLead(token) {
   const r = await fetch(`${API_BASE}/api/automation/runner/tick?limit=1`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
-  const j = await r.json().catch(()=> ({}));
+  const j = await r.json();
   if (!r.ok || !j.success) throw new Error('runner/tick failed');
   return j.leads?.[0] || null;
 }
 
-async function updateStatus(token, leadId, status, action_details = {}) {
+async function updateStatus(token, leadId, status, action_details={}) {
   const r = await fetch(`${API_BASE}/api/automation/update-status`, {
     method: 'POST',
     headers: {
       'Content-Type':'application/json',
       'Authorization': `Bearer ${token}`
     },
-    body: JSON.stringify({
-      lead_id: leadId,
-      status,
-      message: status,
-      action_details
-    })
+    body: JSON.stringify({ lead_id: leadId, status, message: status, action_details })
   });
-  const j = await r.json().catch(()=> ({}));
-  if (!r.ok || !j.success) {
-    console.warn('update-status failed:', j.message || r.status);
-  }
+  const j = await r.json();
+  if (!r.ok || !j.success) console.warn('update-status failed:', j);
 }
 
-// Utility: click the first *visible* locator among candidates
-async function clickFirstVisible(page, locators) {
-  for (const locator of locators) {
-    try {
-      const handle = page.locator(locator).first();
-      if (await handle.count()) {
-        await handle.waitFor({ state: 'visible', timeout: 2000 }).catch(()=>{});
-        const box = await handle.boundingBox().catch(()=>null);
-        if (box) {
-          await handle.click({ delay: jitter(30, 120) });
-          return true;
-        }
-      }
-    } catch (_) {}
-  }
-  return false;
+async function launchFirefox() {
+  // No Chromium flags; Firefox will ignore unsupported ones and crash early.
+  return await firefox.launch({
+    headless: true,         // keep headless in Replit
+  });
 }
 
 async function sendConnection({ profileUrl, note }, li_at) {
-  const browser = await firefox.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox'] });
+  const browser = await launchFirefox();
+
   const ctx = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0'
+    locale: 'en-US',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0',
   });
 
-  // Important cookie
+  // Inject LinkedIn session
   await ctx.addCookies([{
-    name: 'li_at',
-    value: li_at,
-    domain: '.linkedin.com',
-    path: '/',
-    httpOnly: true,
-    secure: true
+    name: 'li_at', value: li_at, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true
   }]);
 
   const page = await ctx.newPage();
 
-  // Navigate to the public profile URL
+  // Open profile
   await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
   await page.waitForTimeout(jitter(800, 1500));
 
-  // Detect logged-out / invalid cookie (sign-in page)
-  if ((await page.url()).includes('/login')) {
-    throw new Error('Invalid or expired li_at (redirected to login).');
+  // Defensive: some profiles redirect to "Sign in" if cookie is bad
+  if (page.url().includes('login') || page.url().includes('/checkpoint/')) {
+    throw new Error('Auth failed or cookie invalid; page redirected to login/checkpoint');
   }
 
-  // Light scroll to trigger lazy UI
-  await page.mouse.wheel(0, jitter(200, 600));
-  await page.waitForTimeout(jitter(600, 1200));
+  // Scroll a bit to trigger lazy UI
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(jitter(400, 900));
 
-  // If already connected/pending, skip safely
-  const alreadyConnected = await page.locator('button:has-text("Message"), button:has-text("Pending"), span:has-text("Pending")').first().count();
-  if (alreadyConnected) {
-    await ctx.close(); await browser.close();
-    return { status: 'skipped', reason: 'Already connected or pending' };
-  }
-
-  // --- Find the real Connect button ---
-  // Primary robust selector: go from the <span> to its ancestor <button>
-  const connectCandidates = [
-    'xpath=//span[normalize-space(.)="Connect"]/ancestor::button[1]',
-    'button[aria-label*="Connect"]',
-    'button:has-text("Connect")',
-    'div[role="button"]:has-text("Connect")'
+  // --- Find and click "Connect" ---
+  // We try several robust selectors; LinkedIn changes markup frequently.
+  const candidates = [
+    // ARIA role-based (best)
+    () => page.getByRole('button', { name: /connect/i }).first(),
+    // text fallback
+    () => page.locator('button:has-text("Connect")').first(),
+    () => page.locator('div[role="button"]:has-text("Connect")').first(),
+    // icon+label span fallback (your example)
+    () => page.locator('button:has(span:has-text("Connect"))').first(),
   ];
 
-  let clickedConnect = await clickFirstVisible(page, connectCandidates);
-
-  // If Connect is in the overflow "More" menu
-  if (!clickedConnect) {
-    const openedMore = await clickFirstVisible(page, [
-      'button[aria-label*="More"]',
-      'button:has-text("More")',
-      'div[role="button"]:has-text("More")'
-    ]);
-
-    if (openedMore) {
-      await page.waitForTimeout(jitter(400, 800));
-      clickedConnect = await clickFirstVisible(page, [
-        'div[role="menu"] button:has-text("Connect")',
-        'div[role="menu"] div[role="button"]:has-text("Connect")',
-        // Some UIs render as anchor
-        'div[role="menu"] a:has-text("Connect")'
-      ]);
+  let clicked = false;
+  for (const fn of candidates) {
+    const btn = fn();
+    if (await btn.count()) {
+      try {
+        await btn.scrollIntoViewIfNeeded();
+        await btn.click({ delay: jitter(40, 120) });
+        clicked = true;
+        break;
+      } catch (e) {
+        // try the next candidate
+      }
     }
   }
+  if (!clicked) throw new Error('Connect button not found');
 
-  if (!clickedConnect) {
-    await ctx.close(); await browser.close();
-    throw new Error('Connect button not found');
-  }
-
-  // Small human delay
-  await page.waitForTimeout(jitter(500, 1200));
-
-  // Some accounts require knowing the person’s email -> detect email field and abort
-  const emailGate = await page.locator('input[type="email"], input[name*="email"]').first().count();
-  if (emailGate) {
-    await ctx.close(); await browser.close();
-    return { status: 'skipped', reason: 'Connect requires email' };
-  }
-
-  // Add a note (optional)
+  // Optional: add a note
   if (note) {
     try {
-      const openedNote = await clickFirstVisible(page, [
-        'button:has-text("Add a note")',
-        'div[role="button"]:has-text("Add a note")'
-      ]);
-      if (openedNote) {
+      const addNoteBtn = page.getByRole('button', { name: /add a note/i }).first();
+      if (await addNoteBtn.count()) {
+        await addNoteBtn.click();
         await page.waitForTimeout(jitter(300, 700));
         const textarea = page.locator('textarea, textarea[name], textarea[id]').first();
-        if (await textarea.count()) {
-          await textarea.fill(note, { timeout: 5000 });
-          await page.waitForTimeout(jitter(300, 600));
-        }
+        await textarea.fill(note);
+        await page.waitForTimeout(jitter(300, 600));
       }
     } catch (e) {
-      // ok to continue without note
-      console.warn('Add note failed:', e.message);
+      console.warn('Add note failed (continuing):', e.message);
     }
   }
 
-  // Click Send in the dialog
-  const sent = await clickFirstVisible(page, [
-    'div[role="dialog"] button:has-text("Send")',
-    'button[aria-label="Send now"]',
-    'button:has-text("Send now")'
-  ]);
-  if (!sent) {
-    // Sometimes dialog is not there — try a generic send
-    const fallback = await clickFirstVisible(page, ['button:has-text("Send")']);
-    if (!fallback) {
-      await ctx.close(); await browser.close();
-      throw new Error('Send button not found');
+  // Send
+  const sendBtn = page.getByRole('button', { name: /^send$/i }).first();
+  if (await sendBtn.count()) {
+    await sendBtn.click({ delay: jitter(40, 120) });
+    await page.waitForTimeout(jitter(600, 1200));
+  } else {
+    // Some dialogs use "Done"
+    const altBtn = page.getByRole('button', { name: /^done$/i }).first();
+    if (await altBtn.count()) {
+      await altBtn.click({ delay: jitter(40, 120) });
+      await page.waitForTimeout(jitter(600, 1200));
+    } else {
+      throw new Error('Send/Done button not found after Connect');
     }
   }
 
-  await page.waitForTimeout(jitter(600, 1200));
   await ctx.close();
   await browser.close();
-
-  return { status: 'connection_sent' };
+  return true;
 }
 
 async function main() {
@@ -227,7 +161,7 @@ async function main() {
   }
 
   const token = await getJWT();
-  const li_at  = await getLiAt(token);
+  const li_at = await getLiAt(token);
 
   let sentToday = 0;
 
@@ -238,29 +172,18 @@ async function main() {
       break;
     }
 
-    const profileUrl = lead.profile_url; // already COALESCE(public_profile_url, profile_url) on server
-    const note = null; // wire your message template later
-
+    const profileUrl = lead.profile_url || lead.public_profile_url;
     console.log(`→ Connecting: ${lead.first_name || ''} ${lead.last_name || ''} | ${profileUrl}`);
+
     try {
       await updateStatus(token, lead.id, 'in_progress');
+      await sendConnection({ profileUrl, note: null }, li_at);
+      await updateStatus(token, lead.id, 'connection_sent', { connection_note_sent: '' });
+      sentToday++;
 
-      const result = await sendConnection({ profileUrl, note }, li_at);
-
-      if (result.status === 'connection_sent') {
-        await updateStatus(token, lead.id, 'connection_sent', { connection_note_sent: note || '' });
-        sentToday++;
-        const pause = jitter(SLEEP_BETWEEN_MS.min, SLEEP_BETWEEN_MS.max);
-        console.log(`✅ Sent. Sleeping ${Math.round(pause/1000)}s`);
-        await sleep(pause);
-      } else if (result.status === 'skipped') {
-        console.log(`↷ Skipped: ${result.reason}`);
-        await updateStatus(token, lead.id, 'skipped', { reason: result.reason });
-        await sleep(jitter(10_000, 20_000));
-      } else {
-        throw new Error('Unknown result');
-      }
-
+      const pause = jitter(SLEEP_BETWEEN_MS.min, SLEEP_BETWEEN_MS.max);
+      console.log(`✅ Sent. Sleeping ${Math.round(pause / 1000)}s`);
+      await sleep(pause);
     } catch (e) {
       console.error('❌ Connect failed:', e.message);
       await updateStatus(token, lead.id, 'error', { error_message: e.message });

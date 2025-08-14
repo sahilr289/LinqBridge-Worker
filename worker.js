@@ -134,44 +134,37 @@ async function launchFirefox() {
   });
 }
 
-async function sendConnection({ profileUrl, note, li_at }) {
-  if (!profileUrl) throw new Error("Missing profileUrl");
-  if (!li_at) throw new Error("Missing li_at cookie in payload");
+async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) {
+  if (!profileUrl) throw new Error('Missing profileUrl');
+  if (!li_at) throw new Error('Missing li_at cookie in payload');
 
   console.log('[flow] launch firefox');
   const browser = await launchFirefox();
   console.log('[flow] new context');
   const ctx = await browser.newContext({
-    locale: "en-US",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0",
+    locale: 'en-US',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0',
+    extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' }
   });
 
+  // ---- Add cookies (li_at required; others optional) ----
   console.log('[flow] add cookies');
-  // Inject LinkedIn session
-  await ctx.addCookies([
-    {
-      name: "li_at",
-      value: li_at,
-      domain: ".linkedin.com",
-      path: "/",
-      httpOnly: true,
-      secure: true,
-    },
-  ]);
+  const cookies = [
+    { name: 'li_at', value: li_at, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+  ];
+  if (jsessionid) cookies.push({ name: 'JSESSIONID', value: jsessionid, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' });
+  if (bcookie)    cookies.push({ name: 'bcookie',    value: bcookie,    domain: '.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' });
+  await ctx.addCookies(cookies);
 
   console.log('[flow] new page');
   const page = await ctx.newPage();
-  page.setDefaultTimeout(10000);               // 10s for element ops
-  page.setDefaultNavigationTimeout(30000);     // 30s for navigations
+  page.setDefaultTimeout(10000);
+  page.setDefaultNavigationTimeout(30000);
+  await page.setViewportSize({ width: 1366, height: 850 });
 
-  // Helpful logging for debugging:
+  // helpful listeners
   page.on('console', msg => console.log('[page]', msg.text()));
   page.on('requestfailed', req => console.warn('[req-failed]', req.method(), req.url(), req.failure()?.errorText));
-  page.on('response', resp => {
-    const url = resp.url();
-    if (url.includes('linkedin')) console.log('[resp]', resp.status(), url.slice(0,120));
-  });
 
   const snap = async (label) => {
     try {
@@ -182,21 +175,32 @@ async function sendConnection({ profileUrl, note, li_at }) {
     } catch {}
   };
 
-  console.log('[flow] goto profile');
-  // Go to profile
-  await page.goto(profileUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 45000,
-  });
-  console.log('[flow] loaded', await page.title().catch(()=>'(no title)'));
-  await page.waitForTimeout(jitter(600, 1200));
+  // ---- 1) Warm up on feed to establish session ----
+  console.log('[flow] warmup feed');
+  await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(800);
 
-  // Check auth
-  if (page.url().includes("login") || page.url().includes("/checkpoint/")) {
-    await snap("auth_redirect");
-    throw new Error(
-      "Auth failed or cookie invalid; redirected to login/checkpoint",
-    );
+  // If we hit authwall/login/checkpoint here, cookie isn't valid
+  const warmUrl = page.url();
+  if (/\/authwall|\/checkpoint|\/login/i.test(warmUrl)) {
+    await snap("warmup_auth_failed");
+    await ctx.close(); 
+    await browser.close();
+    throw new Error('Authwall/login after warmup — li_at is invalid or expired. Capture fresh cookies.');
+  }
+
+  // ---- 2) Now go to the target profile ----
+  console.log('[flow] goto profile');
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  console.log('[flow] loaded', await page.title().catch(()=>'(no title)'));
+  await page.waitForTimeout(800);
+
+  const currentUrl = page.url();
+  if (/\/authwall|\/checkpoint|\/login/i.test(currentUrl)) {
+    await snap("profile_auth_failed");
+    await ctx.close(); 
+    await browser.close();
+    throw new Error('Authwall on profile — session not recognized. Try fresh li_at / add JSESSIONID & bcookie.');
   }
 
   // Already connected / pending?
@@ -373,11 +377,13 @@ const processors = {
   async SEND_CONNECTION(job) {
     const { profileUrl, note, cookieBundle } = job.payload || {};
     const li_at = cookieBundle?.li_at || job.payload?.li_at;
-    console.log('[job] SEND_CONNECTION start', { hasCookie: !!li_at, profileUrl });
+    const jsessionid = cookieBundle?.JSESSIONID || job.payload?.jsessionid;
+    const bcookie = cookieBundle?.bcookie || job.payload?.bcookie;
+    console.log('[job] SEND_CONNECTION start', { hasCookie: !!li_at, hasJsession: !!jsessionid, hasBcookie: !!bcookie, profileUrl });
 
     // 90s total guard for the whole run
     const result = await withWatchdog(
-      sendConnection({ profileUrl, note, li_at }),
+      sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }),
       90_000,
       'sendConnection'
     );

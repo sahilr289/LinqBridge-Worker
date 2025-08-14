@@ -44,6 +44,13 @@ function normalizeSpace(s) {
   return (s || '').replace(/\s+/g, ' ').trim();
 }
 
+function withWatchdog(promise, ms, label='task') {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms))
+  ]);
+}
+
 /**
  * Find and click the Connect action using the precise selectors you provided.
  * Returns true if we clicked something that should open the invite flow or send directly.
@@ -131,13 +138,16 @@ async function sendConnection({ profileUrl, note, li_at }) {
   if (!profileUrl) throw new Error("Missing profileUrl");
   if (!li_at) throw new Error("Missing li_at cookie in payload");
 
+  console.log('[flow] launch firefox');
   const browser = await launchFirefox();
+  console.log('[flow] new context');
   const ctx = await browser.newContext({
     locale: "en-US",
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0",
   });
 
+  console.log('[flow] add cookies');
   // Inject LinkedIn session
   await ctx.addCookies([
     {
@@ -150,8 +160,18 @@ async function sendConnection({ profileUrl, note, li_at }) {
     },
   ]);
 
+  console.log('[flow] new page');
   const page = await ctx.newPage();
-  page.setDefaultTimeout(15000);
+  page.setDefaultTimeout(10000);               // 10s for element ops
+  page.setDefaultNavigationTimeout(30000);     // 30s for navigations
+
+  // Helpful logging for debugging:
+  page.on('console', msg => console.log('[page]', msg.text()));
+  page.on('requestfailed', req => console.warn('[req-failed]', req.method(), req.url(), req.failure()?.errorText));
+  page.on('response', resp => {
+    const url = resp.url();
+    if (url.includes('linkedin')) console.log('[resp]', resp.status(), url.slice(0,120));
+  });
 
   const snap = async (label) => {
     try {
@@ -162,11 +182,13 @@ async function sendConnection({ profileUrl, note, li_at }) {
     } catch {}
   };
 
+  console.log('[flow] goto profile');
   // Go to profile
   await page.goto(profileUrl, {
     waitUntil: "domcontentloaded",
     timeout: 45000,
   });
+  console.log('[flow] loaded', await page.title().catch(()=>'(no title)'));
   await page.waitForTimeout(jitter(600, 1200));
 
   // Check auth
@@ -194,6 +216,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
   await page.mouse.wheel(0, 400);
   await page.waitForTimeout(350);
 
+  console.log('[flow] click connect');
   // CLICK CONNECT using exact selectors and fallbacks
   const clicked = await clickConnect(page);
   if (!clicked) {
@@ -203,6 +226,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
     throw new Error('Connect button not found with exact selectors (aria-label "... to connect", primary Connect, or More → Connect)');
   }
 
+  console.log('[flow] handle dialog or autosend');
   // After clicking Connect, a modal may or may not appear.
   // Wait briefly for a dialog; if none, look for auto-sent signs.
   const maybeDialog = await page
@@ -320,6 +344,7 @@ async function sendConnection({ profileUrl, note, li_at }) {
     throw new Error("Send/Done button not found after Connect");
   }
 
+  console.log('[flow] send finished; verifying');
   // post-click settle
   await page.waitForTimeout(jitter(600, 1200));
 
@@ -348,7 +373,16 @@ const processors = {
   async SEND_CONNECTION(job) {
     const { profileUrl, note, cookieBundle } = job.payload || {};
     const li_at = cookieBundle?.li_at || job.payload?.li_at;
-    const result = await sendConnection({ profileUrl, note, li_at });
+    console.log('[job] SEND_CONNECTION start', { hasCookie: !!li_at, profileUrl });
+
+    // 90s total guard for the whole run
+    const result = await withWatchdog(
+      sendConnection({ profileUrl, note, li_at }),
+      90_000,
+      'sendConnection'
+    );
+
+    console.log('[job] SEND_CONNECTION done', result);
     return result;
   }
 };

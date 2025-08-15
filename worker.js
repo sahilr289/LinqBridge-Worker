@@ -51,76 +51,91 @@ function withWatchdog(promise, ms, label='task') {
   ]);
 }
 
-async function topCard(page) {
-  return page.locator('section[data-view-name*="ProfileTopCard"], .pv-top-card').first();
-}
 
-async function waitTopCardMounted(page) {
-  const top = await topCard(page);
-  await top.waitFor({ state: 'visible', timeout: 12000 }).catch(()=>{});
-  await page.waitForLoadState('domcontentloaded').catch(()=>{});
-  // Wait until the action bar likely has mounted something meaningful
-  await page.waitForFunction(() => {
-    const scope = document.querySelector('section[data-view-name*="ProfileTopCard"], .pv-top-card') || document;
-    const items = Array.from(scope.querySelectorAll('button,[role="button"],a[role="button"]'));
-    return items.some(el => /connect|message|pending|more|follow/i.test((el.innerText||el.getAttribute('aria-label')||'')));
-  }, { timeout: 12000 }).catch(()=>{});
-}
-
-async function dumpButtons(page, label){
-  try {
-    const top = document.querySelector('section[data-view-name*="ProfileTopCard"], .pv-top-card') || document;
-    const rows = Array.from(top.querySelectorAll('button,[role="button"],a[role="button"]'))
-      .filter(el => el.offsetParent !== null)
-      .map(el => ({
-        txt: (el.innerText || el.getAttribute('aria-label') || '').trim(),
-        cls: el.className || '',
-        id : el.id || ''
-      }))
-      .slice(0, 100);
-    console.log(`[UI] ${label} top-card buttons: ` + JSON.stringify(rows));
-  } catch {}
-}
-
-async function clickIfPresent(loc) {
-  if (await loc.count()) {
-    try { await loc.first().scrollIntoViewIfNeeded(); await loc.first().click({ delay: 60 }); return true; } catch {}
-  }
-  return false;
-}
 
 async function clickConnect(page) {
+  const PAUSE_MS = 3000;
+  const pause = async (ms = PAUSE_MS) => { await page.waitForTimeout(ms); };
+
+  const topCard = () =>
+    page.locator('section[data-view-name*="ProfileTopCard"], .pv-top-card').first();
+
+  const waitTopCardMounted = async () => {
+    const top = topCard();
+    await top.waitFor({ state: 'visible', timeout: 12000 }).catch(()=>{});
+    await page.waitForLoadState('domcontentloaded').catch(()=>{});
+    await page.waitForFunction(() => {
+      const scope = document.querySelector('section[data-view-name*="ProfileTopCard"], .pv-top-card') || document;
+      const items = Array.from(scope.querySelectorAll('button,[role="button"],a[role="button"]'));
+      return items.some(el => /connect|message|pending|more|follow/i.test((el.innerText||el.getAttribute('aria-label')||'')));
+    }, { timeout: 12000 }).catch(()=>{});
+  };
+
+  const dumpButtonsTopCard = async (label) => {
+    try {
+      const rows = await page.evaluate(() => {
+        const scope = document.querySelector('section[data-view-name*="ProfileTopCard"], .pv-top-card') || document;
+        return Array.from(scope.querySelectorAll('button,[role="button"],a[role="button"]'))
+          .filter(el => el.offsetParent !== null)
+          .map(el => ({
+            txt: (el.innerText || el.getAttribute('aria-label') || '').trim(),
+            cls: el.className || '',
+            id : el.id || ''
+          }))
+          .slice(0, 100);
+      });
+      console.log(`[UI] ${label} top-card buttons: ${JSON.stringify(rows)}`);
+    } catch {}
+  };
+
+  const clickIfPresent = async (loc) => {
+    if (await loc.count()) {
+      try {
+        const el = loc.first();
+        await el.scrollIntoViewIfNeeded();
+        await el.click({ delay: 60 });
+        await pause(); // wait after each click
+        return true;
+      } catch {}
+    }
+    return false;
+  };
+
+  // --- start: prep & mount ---
   await page.setViewportSize({ width: 1366, height: 850 }).catch(()=>{});
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' })).catch(()=>{});
-  await waitTopCardMounted(page);
+  await waitTopCardMounted();
+  await pause(); // give SPA time
 
-  // If LinkedIn showed an error/empty state, try to recover once.
+  // --- recover from "Try again" empty state if shown ---
   const tryAgain = page.locator('button:has-text("Try again")');
   if (await tryAgain.count()) {
-    console.log('[UI] Found "Try again" in top-card — clicking and retrying');
+    console.log('[UI] Found "Try again" — clicking and re-mounting');
     await clickIfPresent(tryAgain);
-    await page.waitForTimeout(1000);
-    await waitTopCardMounted(page);
+    await waitTopCardMounted();
+    await pause();
   }
 
-  // Dump buttons from TOP-CARD SCOPE ONLY
-  await page.evaluate(dumpButtons); // runs in page context
+  await dumpButtonsTopCard('after-mount');
+  await pause();
 
-  const top = await topCard(page);
+  const top = topCard();
 
-  // --- Degree badge check (authoritative for "already connected")
+  // --- state detection scoped to TOP CARD only ---
   const firstBadge = top.locator('abbr[aria-label*="1st" i], .dist-value:has-text("1st")');
-  const isFirst = await firstBadge.count() > 0;
+  if (await firstBadge.count()) {
+    console.log('[State] 1st-degree badge present — already connected');
+    return 'already_connected';
+  }
 
-  // --- Quick state probes within TOP CARD ONLY
-  const msgTop     = top.locator('button:has-text("Message"), a[role="button"]:has-text("Message"), [aria-label*="Message" i]');
   const pendingTop = top.locator('button:has-text("Pending"), [aria-label*="Pending" i]');
-  const followTop  = top.locator('button:has-text("Follow"), [aria-label*="Follow" i]');
+  if (await pendingTop.count()) {
+    console.log('[State] Invitation pending (top-card)');
+    await pause();
+    return 'pending';
+  }
 
-  if (isFirst) { console.log('[State] 1st-degree badge present — already connected'); return 'already_connected'; }
-  if (await pendingTop.count()) { console.log('[State] Invitation pending (top-card)'); return 'pending'; }
-
-  // --- Direct Connect variants (top card)
+  // --- direct Connect variants in TOP CARD ---
   const ariaInvite = top.locator('button[aria-label$=" to connect" i], button[aria-label^="Invite " i][aria-label$=" to connect" i]');
   if (await clickIfPresent(ariaInvite)) { console.log('[Connect] aria "... to connect" (top-card)'); return true; }
 
@@ -134,14 +149,14 @@ async function clickConnect(page) {
   const dataCn = top.locator('[data-control-name="connect"], a[data-control-name="connect"]');
   if (await clickIfPresent(dataCn)) { console.log('[Connect] data-control-name=connect (top-card)'); return true; }
 
-  // --- Overflow: More → Connect (top card)
+  // --- overflow: More → Connect (top-card) ---
   const moreBtn = top.locator([
     'button[aria-label="More actions"]',
     'button[aria-label*="More" i]',
     'button.artdeco-dropdown__trigger[aria-haspopup="menu"]'
   ].join(', '));
   if (await clickIfPresent(moreBtn)) {
-    await page.waitForTimeout(400);
+    // dropdown animate
     const menuConnect = page.locator([
       '.artdeco-dropdown__content [role="menuitem"]:has-text("Connect")',
       '.artdeco-dropdown__content [role="menuitemcheckbox"]:has-text("Connect")',
@@ -151,9 +166,17 @@ async function clickConnect(page) {
     if (await clickIfPresent(menuConnect)) { console.log('[Connect] More → Connect (top-card)'); return true; }
   }
 
-  if (await followTop.count()) { console.log('[State] Follow-only profile (top-card shows Follow)'); return 'follow_only'; }
+  // --- follow-only clue in top-card ---
+  const followTop = top.locator('button:has-text("Follow"), [aria-label*="Follow" i]');
+  if (await followTop.count()) {
+    console.log('[State] Follow-only profile (top-card shows Follow)');
+    await pause();
+    return 'follow_only';
+  }
 
   console.log('[State] No Connect in top-card; not connected and no action available (no_connect_ui)');
+  await dumpButtonsTopCard('final');
+  await pause();
   return 'no_connect_ui';
 }
 
@@ -224,11 +247,11 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
   // Simulate human activity to unblock "bounce-tracker" throttles
   await page.mouse.move(200, 200);
   await page.mouse.wheel(0, 800);
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(3000);      // <— pause
   await page.keyboard.press('End');
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(3000);      // <— pause
   await page.keyboard.press('Home');
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(3000);      // <— pause
 
   console.log('[flow] loaded', await page.title().catch(()=>'(no title)'));
   await page.waitForTimeout(800);
@@ -315,68 +338,36 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
 
   await page.waitForTimeout(jitter(400, 900));
 
-  // If a dialog opens, try "Add a note" then Send
+  // Optional note flow
   try {
     const addNote = page.getByRole('button', { name: /add a note/i }).first();
     if (await addNote.count()) {
-      await addNote.click({ delay: 50 });
+      await addNote.click({ delay: 60 });
+      await page.waitForTimeout(3000);  // <— pause
       const textarea = page.locator('textarea, textarea[name], textarea[id]').first();
       if (await textarea.count() && note) {
         await textarea.fill(note);
-        await page.waitForTimeout(250);
+        await page.waitForTimeout(3000); // <— pause
       }
     }
   } catch {}
 
-  // Possible "Send" buttons (LinkedIn has many variants)
-  const sendCandidates = [
-    () => page.getByRole("button", { name: /^send$/i }).first(),
-    () => page.getByRole("button", { name: /send without a note/i }).first(),
-    () => page.locator('button:has-text("Send without a note")').first(),
-    () => page.locator('button:has-text("Send")').first(),
-    () => page.locator('[data-control-name*="send_invitation"]').first(),
-  ];
-
-  // If note, fill textarea before clicking send
-  if (note) {
-    try {
-      const textarea = page
-        .locator("textarea, textarea[name], textarea[id]")
-        .first();
-      if (await textarea.count()) {
-        await textarea.fill(note);
-        await page.waitForTimeout(jitter(250, 600));
-      }
-    } catch (e) {
-      // note fill optional; continue sending without note
-    }
-  }
-
-  let sent = false;
-  for (const fn of sendCandidates) {
-    const btn = fn();
-    if (await btn.count()) {
-      try {
-        await btn.click({ delay: jitter(40, 120) });
-        sent = true;
-        break;
-      } catch {}
-    }
-  }
-
-  // Some flows use "Done"
-  if (!sent) {
-    const doneBtn = page.getByRole("button", { name: /^done$/i }).first();
+  let clickedSend = false;
+  const sendBtn = page.getByRole('button', { name: /^send$/i }).first();
+  if (await sendBtn.count()) {
+    await sendBtn.click({ delay: 60 });
+    await page.waitForTimeout(3000);    // <— pause
+    clickedSend = true;
+  } else {
+    const doneBtn = page.getByRole('button', { name: /^done$/i }).first();
     if (await doneBtn.count()) {
-      try {
-        await doneBtn.click({ delay: jitter(40, 120) });
-        sent = true;
-      } catch {}
+      await doneBtn.click({ delay: 60 });
+      await page.waitForTimeout(3000);  // <— pause
+      clickedSend = true;
     }
   }
 
-  // If still not sent, check for error/limit modals
-  if (!sent) {
+  if (!clickedSend) {
     const modalText = await page
       .locator('div[role="dialog"]')
       .first()

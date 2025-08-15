@@ -33,5 +33,8 @@
 
     # Audio (Playwright checks this even headless)
     pkgs.alsa-lib
+    
+    # udev for Chromium
+    pkgs.systemd
   ];
 }

@@ -11,6 +11,9 @@ const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || 'Rohira@0803';
 let jobs = [];
 let jobIdCounter = 1;
 
+// In-memory cookie storage (replace with database in production)
+let userCookies = {};
+
 app.get('/', (req, res) => {
   res.json({ 
     status: 'LinqBridge server running',
@@ -116,6 +119,73 @@ app.get('/jobs/:id', (req, res) => {
     return res.status(404).json({ success: false, message: 'Job not found' });
   }
   
+  res.json({ success: true, job });
+});
+
+// Store cookies for a user
+app.post('/store-cookies', (req, res) => {
+  const { email, cookies, timestamp } = req.body;
+  
+  if (!email || !cookies || !cookies.li_at) {
+    return res.status(400).json({ success: false, message: 'Missing email or li_at cookie' });
+  }
+  
+  userCookies[email] = {
+    ...cookies,
+    timestamp: timestamp || new Date().toISOString()
+  };
+  
+  console.log(`Cookies stored for ${email}`);
+  res.json({ success: true, message: 'Cookies stored successfully' });
+});
+
+// Simple login endpoint (for demo - use proper auth in production)
+app.post('/login', (req, res) => {
+  const { email, password } = req.body;
+  
+  // Simple validation - replace with proper auth
+  if (email === 'sahilrohira55@gmail.com' && password === 'S@hil123') {
+    const token = 'demo-jwt-token-' + Date.now(); // Replace with proper JWT
+    res.json({ success: true, token });
+  } else {
+    res.status(401).json({ success: false, message: 'Invalid credentials' });
+  }
+});
+
+// Enqueue connection job with stored cookies
+app.post('/jobs/enqueue-send-connection', (req, res) => {
+  const { profileUrl, note } = req.body;
+  const auth = req.headers.authorization;
+  
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Missing or invalid token' });
+  }
+  
+  // Extract email from token (simplified - use proper JWT parsing in production)
+  const email = 'sahilrohira55@gmail.com'; // Hardcoded for demo
+  const cookies = userCookies[email];
+  
+  if (!cookies) {
+    return res.status(400).json({ success: false, message: 'No cookies stored for user' });
+  }
+  
+  const job = {
+    id: jobIdCounter++,
+    type: 'SEND_CONNECTION',
+    payload: {
+      profileUrl,
+      note,
+      cookieBundle: cookies
+    },
+    priority: 1,
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  };
+  
+  jobs.push(job);
+  jobs.sort((a, b) => b.priority - a.priority);
+  
+  console.log(`Connection job ${job.id} queued for ${profileUrl}`);
   res.json({ success: true, job });
 });
 

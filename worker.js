@@ -240,55 +240,32 @@ async function addLinkedInCookies(ctx, { li_at, jsessionid, bcookie }) {
 }
 
 async function warmSession(browser, { li_at, jsessionid, bcookie }) {
-  // attempt #1: full cookie set → /feed/
-  let ctx = await browser.newContext({ locale: 'en-US' });
-  let page = await ctx.newPage();
-  await addLinkedInCookies(ctx, { li_at, jsessionid, bcookie });
-  try {
-    console.log('[warmup] try /feed with full cookies');
-    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
-    const u = page.url();
-    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
-    return { ctx, page };
-  } catch (e) {
-    console.warn('[warmup] /feed failed:', e.message);
-    await ctx.close();
-  }
+  // Try with all 3 cookies first, then auto-fallback to li_at only if needed
+  for (const mode of ['full', 'liat']) {
+    const ctx = await browser.newContext({ locale: 'en-US' });
+    const page = await ctx.newPage();
 
-  // attempt #2: li_at only → /feed/
-  ctx = await browser.newContext({ locale: 'en-US' });
-  page = await ctx.newPage();
-  await addLinkedInCookies(ctx, { li_at, jsessionid: null, bcookie: null });
-  try {
-    console.log('[warmup] try /feed with li_at only');
-    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
-    const u = page.url();
-    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
-    return { ctx, page };
-  } catch (e) {
-    console.warn('[warmup] /feed (li_at only) failed:', e.message);
-    await ctx.close();
-  }
+    if (mode === 'full') {
+      console.log('[warmup] using FULL cookies (li_at + JSESSIONID + bcookie)');
+      await addLinkedInCookies(ctx, { li_at, jsessionid, bcookie });
+    } else {
+      console.log('[warmup] falling back to li_at ONLY');
+      await addLinkedInCookies(ctx, { li_at, jsessionid: null, bcookie: null });
+    }
 
-  // attempt #3: li_at only → /mynetwork/
-  ctx = await browser.newContext({ locale: 'en-US' });
-  page = await ctx.newPage();
-  await addLinkedInCookies(ctx, { li_at, jsessionid: null, bcookie: null });
-  try {
-    console.log('[warmup] try /mynetwork with li_at only');
-    await page.goto('https://www.linkedin.com/mynetwork/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
-    const u = page.url();
-    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
-    return { ctx, page };
-  } catch (e) {
-    console.warn('[warmup] /mynetwork failed:', e.message);
-    await ctx.close();
+    try {
+      // simple check page (mynetwork is robust), then caller will goto profile
+      await page.goto('https://www.linkedin.com/mynetwork/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+      const u = page.url();
+      if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
+      return { ctx, page };
+    } catch (e) {
+      console.warn(`[warmup] ${mode} failed:`, e.message);
+      await ctx.close();
+    }
   }
-
-  throw new Error('Warmup failed: invalid or expired cookies (redirect loop/authwall).');
+  throw new Error('Warmup failed: cookies invalid or session expired.');
 }
 
 async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) {
@@ -300,7 +277,7 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
 
   console.log('[flow] warmup (multi-strategy)');
   const { ctx, page } = await warmSession(browser, { li_at, jsessionid, bcookie });
-  await page.waitForTimeout(3000); // small settle pause
+  await page.waitForTimeout(1500);
 
   page.setDefaultTimeout(10000);
   page.setDefaultNavigationTimeout(30000);

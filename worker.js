@@ -51,72 +51,103 @@ function withWatchdog(promise, ms, label='task') {
   ]);
 }
 
+async function waitTopCard(page) {
+  // Wait for the top-card area so the buttons are mounted
+  const topCard = page.locator('section[data-view-name*="ProfileTopCard"], .pv-top-card').first();
+  await topCard.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+}
+
+async function listVisibleButtons(page, label) {
+  try {
+    const texts = await page.$$eval('button, [role="button"]', els =>
+      els
+        .filter(el => el.offsetParent !== null)
+        .map(el => (el.innerText || el.getAttribute('aria-label') || '').trim())
+        .filter(Boolean)
+        .slice(0, 80)
+    );
+    console.log(`[UI] ${label} visible buttons:`, JSON.stringify(texts));
+  } catch {}
+}
+
 /**
- * Find and click the Connect action using the precise selectors you provided.
- * Returns true if we clicked something that should open the invite flow or send directly.
+ * Try all known Connect entry points, then fall back to More → Connect.
+ * Returns true if we clicked Connect.
  */
 async function clickConnect(page) {
-  // Ensure desktop layout & top card in view
   await page.setViewportSize({ width: 1366, height: 850 }).catch(()=>{});
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' })).catch(()=>{});
-  await page.waitForTimeout(400);
+  await waitTopCard(page);
+  await listVisibleButtons(page, 'top-of-profile');
 
-  // 1) Exact aria-label pattern: "Invite <Name> to connect"
-  const inviteBtn = page.locator('button[aria-label$=" to connect"]'); // ends with " to connect"
+  // 0) Early state detection (so we can bail gracefully)
+  const pendingBtn  = page.locator('button:has-text("Pending"), [aria-label*="Pending" i]').first();
+  const messageBtn  = page.locator('button:has-text("Message"), [aria-label*="Message" i]').first();
+  const followBtn   = page.locator('button:has-text("Follow"), [aria-label*="Follow" i]').first();
+  if (await messageBtn.count()) { console.log('[State] Already connected (Message present)'); return 'already_connected'; }
+  if (await pendingBtn.count()) { console.log('[State] Invitation pending'); return 'pending'; }
+
+  // 1) Aria pattern: Invite <Name> to connect
+  const inviteBtn = page.locator('button[aria-label$=" to connect" i], button[aria-label^="Invite " i][aria-label$=" to connect" i]').first();
   if (await inviteBtn.count()) {
-    try {
-      // Guard against false positives by checking visible text contains "Connect"
-      const first = inviteBtn.first();
-      const txt = normalizeSpace(await first.innerText().catch(()=>''));      
-      if (/connect/i.test(txt)) {
-        await first.scrollIntoViewIfNeeded();
-        await first.click({ delay: 60 });
-        console.log('[Connect] clicked aria-label "... to connect" button');
-        return true;
-      }
-    } catch {}
+    try { await inviteBtn.scrollIntoViewIfNeeded(); await inviteBtn.click({ delay: 60 }); console.log('[Connect] clicked aria-label "... to connect"'); return true; } catch {}
   }
 
-  // 2) Primary Connect button on the top card
+  // 2) Primary button with Connect text (span or direct)
   const primaryConnect = page.locator([
-    // Top-card contextual primary button that says Connect
     'section[data-view-name*="ProfileTopCard"] button.artdeco-button--primary:has-text("Connect")',
-    // or any primary connect button visible on the page
-    'button.artdeco-button--primary:has-text("Connect")'
+    'button.artdeco-button--primary:has-text("Connect")',
+    'button:has(span.artdeco-button__text:has-text("Connect"))'
   ].join(', ')).first();
-
   if (await primaryConnect.count()) {
-    try {
-      await primaryConnect.scrollIntoViewIfNeeded();
-      await primaryConnect.click({ delay: 60 });
-      console.log('[Connect] clicked primary Connect button');
-      return true;
-    } catch {}
+    try { await primaryConnect.scrollIntoViewIfNeeded(); await primaryConnect.click({ delay: 60 }); console.log('[Connect] clicked primary Connect'); return true; } catch {}
   }
 
-  // 3) "More actions" → menu item "Connect"
-  const moreBtn = page.locator([
+  // 3) Buttons with connect control-name (LinkedIn frequently sets this)
+  const dataConnect = page.locator('[data-control-name="connect"], a[data-control-name="connect"]').first();
+  if (await dataConnect.count()) {
+    try { await dataConnect.scrollIntoViewIfNeeded(); await dataConnect.click({ delay: 60 }); console.log('[Connect] clicked data-control-name=connect'); return true; } catch {}
+  }
+
+  // 4) Overflow: "More actions" and then menu item
+  // The trigger can vary; try several
+  const moreTriggers = page.locator([
     'button[aria-label="More actions"]',
     'button[aria-label*="More" i]',
-    'button.artdeco-dropdown__trigger[aria-haspopup="menu"]'
-  ].join(', ')).first();
-
-  if (await moreBtn.count()) {
-    try {
-      await moreBtn.scrollIntoViewIfNeeded();
-      await moreBtn.click({ delay: 60 });
-      await page.waitForTimeout(300);
-
-      // menuitem that contains "Connect"
-      const menuConnect = page.locator('[role="menuitem"]:has-text("Connect"), [role="menuitemcheckbox"]:has-text("Connect")').first();
-      if (await menuConnect.count()) {
-        await menuConnect.click({ delay: 60 });
-        console.log('[Connect] clicked More → Connect');
-        return true;
-      }
-    } catch {}
+    'button.artdeco-dropdown__trigger[aria-haspopup="menu"]',
+    'section[data-view-name*="ProfileTopCard"] button.artdeco-dropdown__trigger'
+  ].join(', '));
+  if (await moreTriggers.count()) {
+    for (let i = 0; i < Math.min(await moreTriggers.count(), 3); i++) {
+      const btn = moreTriggers.nth(i);
+      try {
+        await btn.scrollIntoViewIfNeeded();
+        await btn.click({ delay: 60 });
+        await page.waitForTimeout(400);
+        // Connect can be a menuitem or a nested span
+        const menuConnect = page.locator([
+          '[role="menuitem"]:has-text("Connect")',
+          '[role="menuitemcheckbox"]:has-text("Connect")',
+          '.artdeco-dropdown__content [role="button"]:has-text("Connect")',
+          '.artdeco-dropdown__content a:has-text("Connect")'
+        ].join(', ')).first();
+        if (await menuConnect.count()) {
+          await menuConnect.click({ delay: 60 });
+          console.log('[Connect] clicked More → Connect');
+          return true;
+        }
+      } catch {}
+    }
   }
 
+  // 5) Follow-only clue: primary is Follow and no Connect in overflow
+  if (await followBtn.count()) {
+    console.log('[State] Follow-only profile (Follow visible, no Connect found)');
+    return 'follow_only';
+  }
+
+  await listVisibleButtons(page, 'no-connect-found');
   return false;
 }
 
@@ -221,13 +252,29 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
   await page.waitForTimeout(350);
 
   console.log('[flow] click connect');
-  // CLICK CONNECT using exact selectors and fallbacks
-  const clicked = await clickConnect(page);
-  if (!clicked) {
+  const res = await clickConnect(page);
+  if (res === true) {
+    // proceed with note dialog + Send/Done etc.
+  } else if (res === 'already_connected') {
+    await snap("already_connected");
+    await ctx.close();
+    await browser.close();
+    throw new Error('Already connected (Message button present)');
+  } else if (res === 'pending') {
+    await snap("pending");
+    await ctx.close();
+    await browser.close();
+    throw new Error('Invitation already pending');
+  } else if (res === 'follow_only') {
+    await snap("follow_only");
+    await ctx.close();
+    await browser.close();
+    throw new Error('Profile is follow-only (no Connect action available)');
+  } else {
     await snap("no_connect_button");
     await ctx.close();
     await browser.close();
-    throw new Error('Connect button not found with exact selectors (aria-label "... to connect", primary Connect, or More → Connect)');
+    throw new Error('Connect button not found after exhaustive selectors');
   }
 
   console.log('[flow] handle dialog or autosend');
@@ -256,18 +303,18 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
 
   await page.waitForTimeout(jitter(400, 900));
 
-  // If note was requested, try "Add a note" path first.
-  if (note) {
-    try {
-      const addNoteBtn = page
-        .getByRole("button", { name: /add a note/i })
-        .first();
-      if (await addNoteBtn.count()) {
-        await addNoteBtn.click({ delay: jitter(40, 120) });
-        await page.waitForTimeout(jitter(300, 700));
+  // If a dialog opens, try "Add a note" then Send
+  try {
+    const addNote = page.getByRole('button', { name: /add a note/i }).first();
+    if (await addNote.count()) {
+      await addNote.click({ delay: 50 });
+      const textarea = page.locator('textarea, textarea[name], textarea[id]').first();
+      if (await textarea.count() && note) {
+        await textarea.fill(note);
+        await page.waitForTimeout(250);
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   // Possible "Send" buttons (LinkedIn has many variants)
   const sendCandidates = [
@@ -409,10 +456,12 @@ async function runOnce() {
     console.log(`✅ ${job.type} ${job.id} completed:`, result);
     await completeJob(job.id, result);
   } catch (e) {
-    console.error('Worker error:', e.message);
-    const transient = /timeout|navigation|rate limit|temporary|network/i.test(e.message||'');
-    await failJob(job.id, e.message, { 
-      requeue: transient, 
+    const msg = String(e.message || '');
+    console.error('Worker error:', msg);
+    const transient = /timeout|network|temporary|loadstate/i.test(msg);
+    const knownNonTransient = /Already connected|pending|follow-only/i.test(msg);
+    await failJob(job.id, msg, { 
+      requeue: transient && !knownNonTransient, 
       delayMs: transient ? 15000 : 0 
     });
   }

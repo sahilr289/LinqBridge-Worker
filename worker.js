@@ -184,30 +184,90 @@ async function launchFirefox() {
   return await chromium.launch({ headless: true });
 }
 
+async function addLinkedInCookies(ctx, { li_at, jsessionid, bcookie }) {
+  const base = [
+    { name: 'li_at', value: li_at, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+    { name: 'li_at', value: li_at, domain: '.www.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+  ];
+  const extras = [];
+  if (jsessionid) {
+    extras.push(
+      { name: 'JSESSIONID', value: jsessionid, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+      { name: 'JSESSIONID', value: jsessionid, domain: '.www.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+    );
+  }
+  if (bcookie) {
+    extras.push(
+      { name: 'bcookie', value: bcookie, domain: '.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' },
+      { name: 'bcookie', value: bcookie, domain: '.www.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' },
+    );
+  }
+  await ctx.addCookies([...base, ...extras]);
+}
+
+async function warmSession(browser, { li_at, jsessionid, bcookie }) {
+  // attempt #1: full cookie set → /feed/
+  let ctx = await browser.newContext({ locale: 'en-US' });
+  let page = await ctx.newPage();
+  await addLinkedInCookies(ctx, { li_at, jsessionid, bcookie });
+  try {
+    console.log('[warmup] try /feed with full cookies');
+    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+    const u = page.url();
+    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
+    return { ctx, page };
+  } catch (e) {
+    console.warn('[warmup] /feed failed:', e.message);
+    await ctx.close();
+  }
+
+  // attempt #2: li_at only → /feed/
+  ctx = await browser.newContext({ locale: 'en-US' });
+  page = await ctx.newPage();
+  await addLinkedInCookies(ctx, { li_at, jsessionid: null, bcookie: null });
+  try {
+    console.log('[warmup] try /feed with li_at only');
+    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+    const u = page.url();
+    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
+    return { ctx, page };
+  } catch (e) {
+    console.warn('[warmup] /feed (li_at only) failed:', e.message);
+    await ctx.close();
+  }
+
+  // attempt #3: li_at only → /mynetwork/
+  ctx = await browser.newContext({ locale: 'en-US' });
+  page = await ctx.newPage();
+  await addLinkedInCookies(ctx, { li_at, jsessionid: null, bcookie: null });
+  try {
+    console.log('[warmup] try /mynetwork with li_at only');
+    await page.goto('https://www.linkedin.com/mynetwork/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+    const u = page.url();
+    if (/authwall|checkpoint|login/i.test(u)) throw new Error('authwall');
+    return { ctx, page };
+  } catch (e) {
+    console.warn('[warmup] /mynetwork failed:', e.message);
+    await ctx.close();
+  }
+
+  throw new Error('Warmup failed: invalid or expired cookies (redirect loop/authwall).');
+}
+
 async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) {
   if (!profileUrl) throw new Error('Missing profileUrl');
   if (!li_at) throw new Error('Missing li_at cookie in payload');
 
   console.log('[flow] launch firefox');
   const browser = await launchFirefox();
-  console.log('[flow] new context');
-  const ctx = await browser.newContext({
-    locale: 'en-US',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0',
-    extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' }
-  });
 
-  // ---- Add cookies (li_at required; others optional) ----
-  console.log('[flow] add cookies');
-  const cookies = [
-    { name: 'li_at', value: li_at, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
-  ];
-  if (jsessionid) cookies.push({ name: 'JSESSIONID', value: jsessionid, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' });
-  if (bcookie)    cookies.push({ name: 'bcookie',    value: bcookie,    domain: '.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' });
-  await ctx.addCookies(cookies);
+  console.log('[flow] warmup (multi-strategy)');
+  const { ctx, page } = await warmSession(browser, { li_at, jsessionid, bcookie });
+  await page.waitForTimeout(3000); // small settle pause
 
-  console.log('[flow] new page');
-  const page = await ctx.newPage();
   page.setDefaultTimeout(10000);
   page.setDefaultNavigationTimeout(30000);
   await page.setViewportSize({ width: 1366, height: 850 });
@@ -225,24 +285,10 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
     } catch {}
   };
 
-  // ---- 1) Warm up on feed to establish session ----
-  console.log('[flow] warmup feed');
-  await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(800);
-
-  // If we hit authwall/login/checkpoint here, cookie isn't valid
-  const warmUrl = page.url();
-  if (/\/authwall|\/checkpoint|\/login/i.test(warmUrl)) {
-    await snap("warmup_auth_failed");
-    await ctx.close(); 
-    await browser.close();
-    throw new Error('Authwall/login after warmup — li_at is invalid or expired. Capture fresh cookies.');
-  }
-
-  // ---- 2) Now go to the target profile ----
   console.log('[flow] goto profile');
   await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+  await page.waitForTimeout(3000);
 
   // Simulate human activity to unblock "bounce-tracker" throttles
   await page.mouse.move(200, 200);
@@ -461,11 +507,11 @@ async function runOnce() {
   } catch (e) {
     const msg = String(e.message || '');
     console.error('Worker error:', msg);
-    const transient = /timeout|network|temporary|loadstate/i.test(msg);
+    const transient = /redirect|authwall|network|timeout|temporary|loadstate/i.test(msg);
     const knownNonTransient = /Already connected|pending|follow-only/i.test(msg);
     await failJob(job.id, msg, { 
       requeue: transient && !knownNonTransient, 
-      delayMs: transient ? 15000 : 0 
+      delayMs: transient ? 20000 : 0 
     });
   }
 }

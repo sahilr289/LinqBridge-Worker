@@ -211,8 +211,11 @@ async function clickConnect(page) {
   return 'no_connect_ui';
 }
 
-async function launchFirefox() {
-  return await chromium.launch({ headless: true });
+async function launchFirefox() { // keep the old name to minimize edits
+  return await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
 }
 
 async function addLinkedInCookies(ctx, { li_at, jsessionid, bcookie }) {
@@ -303,8 +306,19 @@ async function sendConnection({ profileUrl, note, li_at, jsessionid, bcookie }) 
   page.setDefaultNavigationTimeout(30000);
   await page.setViewportSize({ width: 1366, height: 850 });
 
-  // helpful listeners
-  page.on('console', msg => console.log('[page]', msg.text()));
+  // block extension URLs that the page tries to fetch (noise only)
+  await page.route('**/*', (route) => {
+    const u = route.request().url();
+    if (u.startsWith('chrome-extension://')) return route.abort();
+    return route.continue();
+  });
+
+  // optional: keep console clean
+  page.on('console', (msg) => {
+    const t = msg.text();
+    if (t.includes('chrome-extension://')) return;
+    console.log('[page]', t);
+  });
   page.on('requestfailed', req => console.warn('[req-failed]', req.method(), req.url(), req.failure()?.errorText));
 
   const snap = async (label) => {

@@ -51,6 +51,37 @@ function withWatchdog(promise, ms, label='task') {
   ]);
 }
 
+async function debugCookieOpen(profileUrl, { li_at, jsessionid, bcookie }) {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+  const ctx = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locale: 'en-US'
+  });
+
+  // set cookies on BOTH domains
+  const cookies = [
+    { name: 'li_at', value: li_at, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+    { name: 'li_at', value: li_at, domain: '.www.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+  ];
+  if (jsessionid) cookies.push(
+    { name: 'JSESSIONID', value: jsessionid, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+    { name: 'JSESSIONID', value: jsessionid, domain: '.www.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+  );
+  if (bcookie) cookies.push(
+    { name: 'bcookie', value: bcookie, domain: '.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' },
+    { name: 'bcookie', value: bcookie, domain: '.www.linkedin.com', path: '/', httpOnly: false, secure: true, sameSite: 'None' },
+  );
+  await ctx.addCookies(cookies);
+
+  const page = await ctx.newPage();
+  // go straight to profile (skip /feed warmup)
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  console.log('[debug] landed URL:', page.url());
+  console.log('[debug] title:', await page.title().catch(()=>'-'));
+  await browser.close();
+}
+
 
 
 async function clickConnect(page) {

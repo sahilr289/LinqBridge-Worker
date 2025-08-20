@@ -8,22 +8,24 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy manifests first to leverage layer cache
+# Copy manifests first to leverage cache
 COPY package*.json ./
 
-# If lockfile exists, do deterministic install; else fallback
+# Deterministic if lock exists, else fallback
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# Install browsers + any missing system deps
+# Install Playwright browsers + any missing system deps
 RUN npx playwright install --with-deps chromium
 
-# Copy the rest (includes worker.cjs)
+# Copy the app
 COPY . .
 
 ENV NODE_ENV=production
 ENV SOFT_MODE=false
 ENV HEADLESS=false
 ENV SLOWMO_MS=50
+# Optional: verbose Playwright logs
+# ENV DEBUG=pw:api
 
-# Run headed under a virtual display
+# Start with virtual display so headed mode works on servers
 CMD ["xvfb-run", "-a", "node", "worker.cjs"]

@@ -1,5 +1,27 @@
-// worker.js — LinqBridge Worker (FINAL, headed by default)
+// worker.cjs — LinqBridge Worker (FINAL, headed-ready)
 // Playwright + anti-999 hardening + Connect/Message flows + human pacing + per-domain throttle.
+// Includes a tiny health server so PaaS won’t restart the container.
+
+// -------------------------
+// Health server (optional but helpful on PaaS)
+// -------------------------
+try {
+  const http = require("http");
+  const PORT = process.env.PORT || 3000;
+  http
+    .createServer((req, res) => {
+      if (req.url === "/" || req.url === "/health") {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("OK\n");
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    })
+    .listen(PORT, () => console.log(`[health] listening on :${PORT}`));
+} catch (e) {
+  console.log("[health] server not started:", e?.message || e);
+}
 
 // =========================
 // Env & Config
@@ -7,11 +29,11 @@
 const API_BASE = process.env.API_BASE || "https://calm-rejoicing-linqbridge.up.railway.app";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
-// Headed by default so you can watch the action live
+// Headed by default so you can watch live locally or via video on PaaS (xvfb)
 const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 
-const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true"); // safe default when testing API
+const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true"); // safe default
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
 // Human pacing knobs
@@ -115,7 +137,7 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers
+/** Playwright helpers */
 // =========================
 async function createBrowserContext(cookieBundle, headless = true) {
   if (!chromium) ({ chromium } = require("playwright"));
@@ -143,7 +165,8 @@ async function createBrowserContext(cookieBundle, headless = true) {
     viewport: { width: vw, height: vh },
     deviceScaleFactor: 1,
     javaScriptEnabled: true,
-    recordVideo: headless ? { dir: "/tmp/pw-video" } : undefined,
+    // Always record video; useful when headed on PaaS (xvfb)
+    recordVideo: { dir: "/tmp/pw-video" },
   });
 
   // Light anti-detection shims
@@ -236,15 +259,15 @@ async function isAuthWalledOrGuest(page) {
 }
 
 async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 4, salesNavUrl, salesProfileUrn } = {}) {
-  const mobile   = rawUrl.includes("/in/") ? rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/") : rawUrl;
-  const desktop1 = withParams(rawUrl);
-  const desktop2 = withParams(rawUrl, { lipi: "urn-li-pi-" + Math.random().toString(36).slice(2) });
+  const mobile   = rawUrl && rawUrl.includes("/in/") ? rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/") : rawUrl;
+  const desktop1 = rawUrl ? withParams(rawUrl) : null;
+  const desktop2 = rawUrl ? withParams(rawUrl, { lipi: "urn-li-pi-" + Math.random().toString(36).slice(2) }) : null;
 
   const snFromPayload = salesNavUrl
     ? salesNavUrl
     : (salesProfileUrn ? `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}` : null);
 
-  const candidates = [mobile, desktop1, desktop2].concat(snFromPayload ? [snFromPayload] : []);
+  const candidates = [mobile, desktop1, desktop2, snFromPayload].filter(Boolean);
 
   let lastErr, lastStatus = null, usedUrl = null, finalUrl = null;
   for (let i = 0; i < Math.min(attempts, candidates.length); i++) {
@@ -620,7 +643,11 @@ async function handleSendConnection(job) {
     ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    const nav = await navigateLinkedInWithRetries(page, targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`), { attempts: 4, salesNavUrl, salesProfileUrn });
+    const nav = await navigateLinkedInWithRetries(
+      page,
+      targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`),
+      { attempts: 4, salesNavUrl, salesProfileUrn }
+    );
     if (!nav.authed) {
       const result = {
         mode: "real", profileUrl: targetUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
@@ -706,7 +733,11 @@ async function handleSendMessage(job) {
     ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    const nav = await navigateLinkedInWithRetries(page, targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`), { attempts: 4, salesNavUrl, salesProfileUrn });
+    const nav = await navigateLinkedInWithRetries(
+      page,
+      targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`),
+      { attempts: 4, salesNavUrl, salesProfileUrn }
+    );
     if (!nav.authed) {
       const result = {
         mode: "real", profileUrl: targetUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),

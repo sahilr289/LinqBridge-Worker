@@ -1,20 +1,13 @@
 {
-  "name": "linqbridge",
+  "name": "linqbridge-worker",
   "version": "1.0.0",
-  "main": "index.js",
+  "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node index.js",
-    "worker": "node worker.js",
-    "playwright:install": "npx playwright install firefox"
+    "start": "node worker.js",
+    "postinstall": "playwright install --with-deps chromium"
   },
   "dependencies": {
-    "axios": "^1.11.0",
-    "bcryptjs": "^3.0.2",
-    "better-sqlite3": "^12.2.0",
-    "cors": "^2.8.5",
-    "exceljs": "^4.4.0",
-    "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2",
-    "playwright": "^1.54.2"
+    "playwright": "^1.47.0"
   }
 }

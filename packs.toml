@@ -6,7 +6,6 @@ nixPkgs = [
 ]
 
 [phases.install]
-# Use 'sh -lc' so conditionals work
 cmds = [
   "sh -lc 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'",
   "npx playwright install --with-deps chromium"

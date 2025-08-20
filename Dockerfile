@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for better Docker layer caching
+# Copy manifests first for caching
 COPY package*.json ./
 
 # Install prod deps: prefer npm ci if lockfile present, else npm install
@@ -53,15 +53,16 @@ RUN if [ -f package-lock.json ]; then \
       npm install --omit=dev; \
     fi
 
-# Install the Playwright browser binaries (Chromium only to keep image smaller)
-RUN npx playwright install --with-deps chromium
+# IMPORTANT: set the browsers path BEFORE installing browsers,
+# so install and runtime paths match.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV NODE_ENV=production
+
+# Install Chromium browser binaries into /ms-playwright
+RUN npx playwright install chromium
 
 # Copy the rest of the worker code
 COPY . .
 
-# Default envs (override in Railway)
-ENV NODE_ENV=production \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
-# Run the worker
+# Start the worker
 CMD ["node", "worker.js"]

@@ -1,13 +1,15 @@
 {
   "name": "linqbridge-worker",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
+  "main": "worker.js",
   "scripts": {
-    "start": "node worker.js",
-    "postinstall": "playwright install --with-deps chromium"
+    "start": "node worker.js"
   },
   "dependencies": {
-    "playwright": "^1.47.0"
+    "playwright": "^1.47.2",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
   }
 }

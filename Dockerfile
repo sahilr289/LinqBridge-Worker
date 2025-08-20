@@ -58,7 +58,7 @@ COPY . .
 # Environment defaults (override in Railway)
 ENV API_BASE=https://calm-rejoicing-linqbridge.up.railway.app
 ENV WORKER_SHARED_SECRET=S@hil123
-ENV HEADLESS=true
+ENV HEADLESS=false
 ENV SOFT_MODE=false
 ENV POLL_INTERVAL_MS=5000
 

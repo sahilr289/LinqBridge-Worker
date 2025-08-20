@@ -1,13 +1,11 @@
-// worker.js — LinqBridge Worker (Playwright + Job Runner)
-// Run with: node worker.js
+// worker.js — LinqBridge Worker (ESM, Playwright + Job Runner)
 // Env required:
 //   API_BASE, WORKER_SHARED_SECRET
 //   HEADLESS=true|false, SOFT_MODE=true|false
 // Optional:
 //   POLL_INTERVAL_MS=5000, JOB_TYPES=SEND_CONNECTION
 
-const { chromium } = require("playwright"); // browsers must be installed in image
-const fetch = require("node-fetch");        // Node18+ has fetch; keep for portability
+import { chromium } from "playwright";
 
 // ---------- Config ----------
 const API_BASE = process.env.API_BASE || "http://localhost:8080";
@@ -29,7 +27,7 @@ const JOB_TYPES = (process.env.JOB_TYPES || "SEND_CONNECTION")
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
 
-// ---------- HTTP helpers ----------
+// ---------- HTTP helpers (Node 18+ has global fetch) ----------
 async function apiPost(path, body) {
   const url = `${API_BASE}${path}`;
   const res = await fetch(url, {
@@ -89,7 +87,6 @@ async function newBrowserContextWithCookies(cookieBundle) {
     });
   }
   if (cookieBundle?.jsessionid) {
-    // Ensure no surrounding quotes for Playwright cookie value
     let val = cookieBundle.jsessionid;
     if (val.length >= 2 && val.startsWith('"') && val.endsWith('"')) {
       val = val.slice(1, -1);
@@ -121,9 +118,8 @@ async function newBrowserContextWithCookies(cookieBundle) {
   }
 
   const page = await context.newPage();
-  // Make initial hop to set cookie jar
-  await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 45000 })
-    .catch(() => {});
+  // Initial hop to set cookie jar
+  await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
   return { browser, context, page };
 }
 
@@ -137,7 +133,6 @@ async function gotoLinkedInProfile(page, rawUrl) {
   const url = normalizeUrl(rawUrl);
   if (!url) throw new Error("Invalid profileUrl");
 
-  // Retry strategy: first domcontentloaded, then load fallback
   const tries = [
     { waitUntil: "domcontentloaded", timeout: 45000 },
     { waitUntil: "load", timeout: 45000 },
@@ -147,9 +142,7 @@ async function gotoLinkedInProfile(page, rawUrl) {
   for (const t of tries) {
     try {
       await page.goto(url, t);
-      // Wait for the main column to confirm we’re on a profile-like page
       await page.waitForTimeout(800);
-      // common containers on /in/ pages
       await Promise.race([
         page.locator("main").waitFor({ timeout: 8000 }),
         page.locator("[data-view-name]").waitFor({ timeout: 8000 }),
@@ -158,7 +151,6 @@ async function gotoLinkedInProfile(page, rawUrl) {
       return true;
     } catch (e) {
       lastErr = e;
-      // sometimes ERR_ABORTED occurs; small wait then retry
       await page.waitForTimeout(800);
     }
   }
@@ -167,69 +159,53 @@ async function gotoLinkedInProfile(page, rawUrl) {
 
 async function tryClickConnect(page) {
   // Try common “Connect” entry points
-  const candidates = [
-    // LinkedIn profile header “Connect”
-    page.getByRole("button", { name: /connect/i }),
-    page.locator('button:has-text("Connect")'),
-    // Three-dots menu -> Connect
-    page.locator('[aria-label*="More actions"]'),
-    page.locator('div[role="menuitem"]:has-text("Connect")'),
-  ];
-
-  // 1) Direct Connect button present?
-  const direct = await candidates[0].first();
+  const direct = page.getByRole("button", { name: /connect/i }).first();
   if (await direct.isVisible().catch(() => false)) {
     await direct.click({ delay: 50 });
   } else {
-    // 2) Open kebab menu, then choose Connect
-    const kebab = candidates[2];
+    const kebab = page.locator('[aria-label*="More actions"]').first();
     if (await kebab.isVisible().catch(() => false)) {
       await kebab.click({ delay: 50 });
       await page.waitForTimeout(200);
-      const menuConnect = candidates[3];
+      const menuConnect = page.locator('div[role="menuitem"]:has-text("Connect")').first();
       if (await menuConnect.isVisible().catch(() => false)) {
         await menuConnect.click({ delay: 50 });
       }
     }
   }
-
-  // Now a dialog may appear: either with “Add a note” or straight “Send”
   return true;
 }
 
 async function maybeAddNoteAndSend(page, noteText) {
-  // If user wants to add a note, click “Add a note” first
   if (noteText) {
-    const addNote = page.getByRole("button", { name: /add a note/i });
+    const addNote = page.getByRole("button", { name: /add a note/i }).first();
     if (await addNote.isVisible().catch(() => false)) {
       await addNote.click({ delay: 50 });
     }
-    // Type into note textarea/field
-    const noteBox = page.locator('textarea[name="message"]')
+    const noteBox = page
+      .locator('textarea[name="message"]')
       .or(page.locator('textarea[aria-label*="Add a note"]'))
-      .or(page.locator('textarea'));
-    if (await noteBox.first().isVisible().catch(() => false)) {
-      await noteBox.first().fill(noteText.slice(0, 280), { timeout: 5000 }).catch(() => {});
+      .or(page.locator("textarea"))
+      .first();
+
+    if (await noteBox.isVisible().catch(() => false)) {
+      await noteBox.fill(noteText.slice(0, 280), { timeout: 5000 }).catch(() => {});
     }
   }
 
-  // Finally, click Send (unless soft mode)
-  const sendBtn = page.getByRole("button", { name: /^send$/i })
-    .or(page.locator('button:has-text("Send")'));
+  const sendBtn = page.getByRole("button", { name: /^send$/i }).or(page.locator('button:has-text("Send")')).first();
 
   if (SOFT_MODE) {
-    // Don’t click send in soft mode
     return { clicked: false, reason: "soft_mode" };
-  }
+    }
 
-  if (await sendBtn.first().isVisible().catch(() => false)) {
-    await sendBtn.first().click({ delay: 50 });
-    // Give LI a breath to submit
+  if (await sendBtn.isVisible().catch(() => false)) {
+    await sendBtn.click({ delay: 50 });
     await page.waitForTimeout(1000);
     return { clicked: true };
   }
 
-  // Some flows auto-send without extra dialog, treat as sent
+  // Sometimes LinkedIn auto-sends or the flow differs — assume success
   return { clicked: true, assumed: true };
 }
 
@@ -244,9 +220,7 @@ async function handleSendConnection(job) {
     throw new Error("Missing profileUrl or li_at in job payload");
   }
 
-  const note = noteRaw
-    ? noteRaw.replace(/\{\{first\}\}/gi, "").trim() // (Optional: you could personalize if you pass firstName)
-    : null;
+  const note = noteRaw ? noteRaw.replace(/\{\{first\}\}/gi, "").trim() : null;
 
   const { browser, context, page } = await newBrowserContextWithCookies({
     li_at: cookieBundle.li_at,
@@ -258,14 +232,10 @@ async function handleSendConnection(job) {
     await gotoLinkedInProfile(page, profileUrl);
     await page.waitForTimeout(800);
 
-    // Try to click “Connect”
     await tryClickConnect(page);
     await page.waitForTimeout(400);
 
-    // Add note and/or send
     const sendRes = await maybeAddNoteAndSend(page, note);
-
-    // Small post-wait to let LinkedIn process
     await page.waitForTimeout(1200);
 
     return {
@@ -287,10 +257,7 @@ async function pollOnceAndProcess() {
     return;
   }
   const job = next.data.job;
-  if (!job) {
-    // Nothing to do
-    return;
-  }
+  if (!job) return;
 
   console.log(`[worker] got job ${job.id} type=${job.type}`);
 

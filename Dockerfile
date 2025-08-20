@@ -1,31 +1,33 @@
 FROM node:20-slim
 
-# Playwright deps + Xvfb
+# System deps for Playwright + X stack
 RUN apt-get update && apt-get install -y \
-    xvfb libnss3 libatk-bridge2.0-0 libgtk-3-0 libdrm2 libgbm1 libasound2 \
+    xvfb x11vnc novnc websockify \
+    libnss3 libatk-bridge2.0-0 libgtk-3-0 libdrm2 libgbm1 libasound2 \
     libxdamage1 libxfixes3 libxcomposite1 libxrandr2 libxkbcommon0 libpango-1.0-0 \
-    libpangocairo-1.0-0 libcairo2 fonts-liberation && rm -rf /var/lib/apt/lists/*
+    libpangocairo-1.0-0 libcairo2 fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy manifests first to leverage cache
+# Copy manifests first for better caching
 COPY package*.json ./
 
-# Deterministic if lock exists, else fallback
+# Install node deps (deterministic if lockfile present)
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
 # Install Playwright browsers + any missing system deps
 RUN npx playwright install --with-deps chromium
 
-# Copy the app
+# Copy app code and entrypoint
 COPY . .
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
 ENV NODE_ENV=production
-ENV SOFT_MODE=false
-ENV HEADLESS=false
-ENV SLOWMO_MS=50
-# Optional: verbose Playwright logs
-# ENV DEBUG=pw:api
+ENV SOFT_MODE=false          # set true to dry-run without browser
+ENV HEADLESS=false           # headed so you can watch
+ENV SLOWMO_MS=50             # slow down actions a bit so they are visible
 
-# Start with virtual display so headed mode works on servers
-CMD ["xvfb-run", "-a", "node", "worker.cjs"]
+# On most PaaS, the platform sets $PORT; start.sh binds noVNC on $PORT
+CMD ["/app/start.sh"]

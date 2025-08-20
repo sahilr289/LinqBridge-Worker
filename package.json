@@ -6,8 +6,7 @@
   "main": "worker.cjs",
   "scripts": {
     "start": "node worker.cjs",
-    "start:headed": "SOFT_MODE=false HEADLESS=false SLOWMO_MS=50 node worker.cjs",
-    "start:headed:xvfb": "SOFT_MODE=false HEADLESS=false SLOWMO_MS=50 xvfb-run -a node worker.cjs"
+    "start:headed": "SOFT_MODE=false HEADLESS=false SLOWMO_MS=50 node worker.cjs"
   },
   "dependencies": {
     "playwright": "^1.47.2"

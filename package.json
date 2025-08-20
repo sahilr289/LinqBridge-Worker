@@ -2,12 +2,10 @@
   "name": "linqbridge-worker",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
-  "main": "worker.js",
-  "scripts": { "start": "node worker.js" },
+  "scripts": {
+    "start": "node worker.cjs"
+  },
   "dependencies": {
-    "playwright": "^1.47.2",
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5"
+    "playwright": "^1.46.0"
   }
 }

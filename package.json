@@ -4,9 +4,7 @@
   "private": true,
   "type": "module",
   "main": "worker.js",
-  "scripts": {
-    "start": "node worker.js"
-  },
+  "scripts": { "start": "node worker.js" },
   "dependencies": {
     "playwright": "^1.47.2",
     "node-fetch": "^3.3.2",

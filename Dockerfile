@@ -43,26 +43,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for caching
+# Copy only manifests first (better layer caching)
 COPY package*.json ./
 
-# Install prod deps: prefer npm ci if lockfile present, else npm install
-RUN if [ -f package-lock.json ]; then \
-      npm ci --omit=dev; \
-    else \
-      npm install --omit=dev; \
-    fi
+# Install production dependencies
+RUN npm install --omit=dev
 
-# IMPORTANT: set the browsers path BEFORE installing browsers,
-# so install and runtime paths match.
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV NODE_ENV=production
+# Install Chromium browser (already present in this base image, but safe to run)
+RUN npx playwright install chromium --with-deps
 
-# Install Chromium browser binaries into /ms-playwright
-RUN npx playwright install chromium
-
-# Copy the rest of the worker code
+# Now copy the rest of the app, including worker.cjs
 COPY . .
 
-# Start the worker
-CMD ["node", "worker.js"]
+# Environment defaults (override in Railway)
+ENV API_BASE=https://calm-rejoicing-linqbridge.up.railway.app
+ENV WORKER_SHARED_SECRET=S@hil123
+ENV HEADLESS=true
+ENV SOFT_MODE=true
+ENV POLL_INTERVAL_MS=5000
+
+CMD ["npm", "start"]

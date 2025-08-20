@@ -2,13 +2,17 @@
   "name": "linqbridge-worker",
   "version": "1.0.0",
   "private": true,
-  "scripts": { "start": "node worker.cjs" },
-  "dependencies": { "playwright": "^1.46.0" }
-}
-{
+  "type": "commonjs",
+  "main": "worker.cjs",
   "scripts": {
     "start": "node worker.cjs",
     "start:headed": "SOFT_MODE=false HEADLESS=false SLOWMO_MS=50 node worker.cjs",
     "start:headed:xvfb": "SOFT_MODE=false HEADLESS=false SLOWMO_MS=50 xvfb-run -a node worker.cjs"
+  },
+  "dependencies": {
+    "playwright": "^1.47.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -59,7 +59,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV NODE_ENV=production
 
 # Install Chromium browser binaries into /ms-playwright
-RUN npx playwright install chromium
+RUN npx playwright install chromium --with-deps
 
 # Copy the rest of the worker code
 COPY . .

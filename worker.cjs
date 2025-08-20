@@ -1,31 +1,32 @@
-// worker.cjs — LinqBridge Worker (FINAL)
-// Hardened login, Sales Nav → public resolver, Connect + Message flows,
-// human-like pacing & per-domain throttle, headless-friendly tracing & screenshots.
+// worker.js — LinqBridge Worker (FINAL, headed by default)
+// Playwright + anti-999 hardening + Connect/Message flows + human pacing + per-domain throttle.
 
 // =========================
 // Env & Config
 // =========================
 const API_BASE = process.env.API_BASE || "https://calm-rejoicing-linqbridge.up.railway.app";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
-const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "true");
-const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true"); // default safe
+
+// Headed by default so you can watch the action live
+const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
+const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
+
+const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true"); // safe default when testing API
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
-// ---- Human pacing knobs (safe defaults) ----
-const MAX_ACTIONS_PER_HOUR = parseInt(process.env.MAX_ACTIONS_PER_HOUR || "35", 10); // hourly cap (rolling window)
-const MIN_GAP_MS = parseInt(process.env.MIN_GAP_MS || "25000", 10);                  // min gap between actions
+// Human pacing knobs
+const MAX_ACTIONS_PER_HOUR = parseInt(process.env.MAX_ACTIONS_PER_HOUR || "35", 10);
+const MIN_GAP_MS = parseInt(process.env.MIN_GAP_MS || "25000", 10);
 const COOLDOWN_AFTER_SENT_MS = parseInt(process.env.COOLDOWN_AFTER_SENT_MS || "45000", 10);
 const COOLDOWN_AFTER_FAIL_MS = parseInt(process.env.COOLDOWN_AFTER_FAIL_MS || "90000", 10);
 
-// Micro-delays around actions for human-ness
 const MICRO_DELAY_MIN_MS = parseInt(process.env.MICRO_DELAY_MIN_MS || "400", 10);
 const MICRO_DELAY_MAX_MS = parseInt(process.env.MICRO_DELAY_MAX_MS || "1200", 10);
 
-// Throttle jitter while waiting
 const THROTTLE_JITTER_MIN_MS = parseInt(process.env.THROTTLE_JITTER_MIN_MS || "1500", 10);
 const THROTTLE_JITTER_MAX_MS = parseInt(process.env.THROTTLE_JITTER_MAX_MS || "3500", 10);
 
-// Optionally load Playwright only when needed (saves cold-start in soft mode)
+// Lazy import
 let chromium = null;
 
 // =========================
@@ -54,7 +55,7 @@ async function apiGet(path) {
     const json = JSON.parse(text);
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
     return json;
-  } catch (e) {
+  } catch {
     throw new Error(`GET ${path} non-JSON or error ${res.status}: ${text}`);
   }
 }
@@ -71,13 +72,13 @@ async function apiPost(path, body) {
     const json = JSON.parse(text);
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
     return json;
-  } catch (e) {
+  } catch {
     throw new Error(`POST ${path} non-JSON or error ${res.status}: ${text}`);
   }
 }
 
 // =========================
-// Per-domain Throttle (rolling 1-hour window + min gap + cooldowns)
+// Per-domain Throttle
 // =========================
 class DomainThrottle {
   constructor() { this.state = new Map(); } // domain -> { lastActionAt, events: number[], cooldownUntil }
@@ -86,7 +87,7 @@ class DomainThrottle {
     return this.state.get(domain);
   }
   _pruneOld(events) {
-    const cutoff = now() - 3600_000; // 1 hour window
+    const cutoff = now() - 3600_000;
     while (events.length && events[0] < cutoff) events.shift();
   }
   async reserve(domain, label = "action") {
@@ -114,89 +115,105 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers (anti-999 hardening + debug tracing)
+// Playwright helpers
 // =========================
 async function createBrowserContext(cookieBundle, headless = true) {
   if (!chromium) ({ chromium } = require("playwright"));
 
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
   const browser = await chromium.launch({
     headless,
+    slowMo: SLOWMO_MS,
     args: [
-      "--no-sandbox", "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-gpu", "--disable-extensions", "--disable-background-networking",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      // minimal flags; avoid odd disable-feature combos
     ],
   });
 
+  // Randomize viewport a bit to avoid “stock” sizes
+  const vw = 1280 + Math.floor(Math.random() * 192); // 1280–1471
+  const vh = 720 + Math.floor(Math.random() * 160);  // 720–879
+
   const context = await browser.newContext({
-    userAgent: UA, locale: "en-US", timezoneId: "America/Los_Angeles",
-    colorScheme: "light", viewport: { width: 1366, height: 768 }, deviceScaleFactor: 1,
+    // Let Chromium set UA + client hints; DO NOT force a static UA
+    locale: "en-US",
+    timezoneId: "America/Los_Angeles",
+    colorScheme: "light",
+    viewport: { width: vw, height: vh },
+    deviceScaleFactor: 1,
     javaScriptEnabled: true,
-    extraHTTPHeaders: {
-      "accept-language": "en-US,en;q=0.9",
-      "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"',
-      "sec-ch-ua-platform": '"Windows"',
-      "sec-ch-ua-mobile": "?0",
-      "upgrade-insecure-requests": "1",
-    },
+    recordVideo: headless ? { dir: "/tmp/pw-video" } : undefined,
   });
 
-  // Hide webdriver flag
+  // Light anti-detection shims
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
+    try {
+      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+      Object.defineProperty(navigator, "language", { get: () => "en-US" });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
+      if (originalQuery) {
+        navigator.permissions.query = (p) =>
+          p?.name === "notifications" ? Promise.resolve({ state: "denied" }) : originalQuery(p);
+      }
+    } catch {}
   });
 
-  // Helper to map a cookie spec across host variants
+  // Map cookie spec across host variants (NO leading dot)
   const expandDomains = (cookie) => ([
-    { ...cookie, domain: ".linkedin.com" },
+    { ...cookie, domain: "linkedin.com" },
     { ...cookie, domain: "www.linkedin.com" },
     { ...cookie, domain: "m.linkedin.com" },
   ]);
 
-  // Build cookie list (SameSite=None + Secure)
   let cookies = [];
   if (cookieBundle?.li_at) {
-    cookies = cookies.concat(expandDomains({ name: "li_at", value: cookieBundle.li_at, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
+    cookies = cookies.concat(expandDomains({
+      name: "li_at", value: cookieBundle.li_at, path: "/",
+      httpOnly: true, secure: true, sameSite: "None",
+    }));
   }
   if (cookieBundle?.jsessionid) {
-    cookies = cookies.concat(expandDomains({ name: "JSESSIONID", value: `"${cookieBundle.jsessionid}"`, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
+    cookies = cookies.concat(expandDomains({
+      name: "JSESSIONID", value: `"${cookieBundle.jsessionid}"`, path: "/",
+      httpOnly: true, secure: true, sameSite: "None",
+    }));
   }
   if (cookieBundle?.bcookie) {
-    cookies = cookies.concat(expandDomains({ name: "bcookie", value: cookieBundle.bcookie, path: "/", httpOnly: false, secure: true, sameSite: "None" }));
+    cookies = cookies.concat(expandDomains({
+      name: "bcookie", value: cookieBundle.bcookie, path: "/",
+      httpOnly: false, secure: true, sameSite: "None",
+    }));
   }
   if (cookieBundle?.lang) {
-    cookies = cookies.concat(expandDomains({ name: "lang", value: cookieBundle.lang, path: "/", httpOnly: false, secure: true, sameSite: "None" }));
+    cookies = cookies.concat(expandDomains({
+      name: "lang", value: cookieBundle.lang, path: "/",
+      httpOnly: false, secure: true, sameSite: "None",
+    }));
   }
   if (cookies.length) await context.addCookies(cookies);
 
-  // Block heavy/noisy resources
+  // Allow ALL first-party LinkedIn/LICDN; trim only obvious 3P trackers
   await context.route("**/*", (route) => {
-    const req = route.request(); const type = req.resourceType();
-    if (type === "image" || type === "media" || type === "font") return route.abort();
-    const url = req.url();
-    if (/\.(png|jpg|jpeg|gif|webp|svg)(\?|$)/i.test(url)) return route.abort();
-    if (/doubleclick|google-analytics|adservice|facebook|hotjar|segment/.test(url)) return route.abort();
+    const url = route.request().url();
+    try {
+      const host = new URL(url).hostname.replace(/^www\./, "");
+      const isFirstParty = host.endsWith("linkedin.com") || host.endsWith("licdn.com");
+      if (isFirstParty) return route.continue();
+    } catch {}
+    if (/doubleclick|googletagmanager|adservice|facebook|hotjar|segment|optimizely/i.test(url)) return route.abort();
     return route.continue();
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(20000); page.setDefaultNavigationTimeout(30000);
+  page.setDefaultTimeout(20000);
+  page.setDefaultNavigationTimeout(30000);
   page.on("console", (msg) => { try { console.log("[page console]", msg.type(), msg.text()); } catch {} });
+  try { await page.bringToFront(); } catch {}
 
   return { browser, context, page };
-}
-
-// ---------- Navigation & Auth helpers ----------
-async function isAuthWalledOrGuest(page) {
-  try {
-    const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
-    if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true;
-    // quick guest heuristics
-    const hasGuest = await page.locator('a[href*="login"]').first().isVisible({ timeout: 500 }).catch(() => false);
-    return !!hasGuest;
-  } catch { return false; }
 }
 
 function withParams(u, extra = {}) {
@@ -204,25 +221,30 @@ function withParams(u, extra = {}) {
     const url = new URL(u);
     if (!url.searchParams.get("trk")) url.searchParams.set("trk", "public_profile_nav");
     url.searchParams.set("original_referer", "https://www.google.com/");
-    for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, v);
+    for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, String(v));
     return url.toString();
   } catch { return u; }
 }
 
-/**
- * Try multiple URL candidates: desktop → desktop+param → mobile → Sales Nav (if provided).
- * Returns { status, usedUrl, finalUrl, authed, error? }
- */
+async function isAuthWalledOrGuest(page) {
+  try {
+    const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
+    if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true;
+    const hasLogin = await page.locator('a[href*="login"]').first().isVisible({ timeout: 600 }).catch(() => false);
+    return !!hasLogin;
+  } catch { return false; }
+}
+
 async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 4, salesNavUrl, salesProfileUrn } = {}) {
+  const mobile   = rawUrl.includes("/in/") ? rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/") : rawUrl;
   const desktop1 = withParams(rawUrl);
   const desktop2 = withParams(rawUrl, { lipi: "urn-li-pi-" + Math.random().toString(36).slice(2) });
-  const mobile   = rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/");
 
   const snFromPayload = salesNavUrl
     ? salesNavUrl
     : (salesProfileUrn ? `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}` : null);
 
-  const candidates = [desktop1, desktop2, mobile].concat(snFromPayload ? [snFromPayload] : []);
+  const candidates = [mobile, desktop1, desktop2].concat(snFromPayload ? [snFromPayload] : []);
 
   let lastErr, lastStatus = null, usedUrl = null, finalUrl = null;
   for (let i = 0; i < Math.min(attempts, candidates.length); i++) {
@@ -231,36 +253,38 @@ async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 4, salesNa
       const resp = await page.goto(target, { waitUntil: "domcontentloaded", timeout: 28000 });
       usedUrl = target;
       lastStatus = resp ? resp.status() : null;
-      await page.waitForTimeout(900);
+
+      // tiny human jitter
+      try { await page.mouse.move(30 + Math.random()*100, 20 + Math.random()*80, { steps: 3 }); } catch {}
+      await page.waitForTimeout(700 + Math.random() * 900);
+
       const authed = !(await isAuthWalledOrGuest(page));
       finalUrl = page.url();
+
       if (lastStatus && lastStatus >= 200 && lastStatus < 400 && authed) {
+        // small scroll to let profile CTAs render
+        try { await page.mouse.wheel(0, 200 + Math.floor(Math.random()*200)); } catch {}
+        await page.waitForTimeout(400 + Math.random()*600);
         return { status: lastStatus, usedUrl, finalUrl, authed: true };
       }
-      await page.waitForTimeout(700 + Math.random() * 700); // small backoff before next candidate
+      await page.waitForTimeout(900 + Math.random() * 1100);
     } catch (e) {
-      lastErr = e; await page.waitForTimeout(900 + Math.random() * 900);
+      lastErr = e;
+      await page.waitForTimeout(900 + Math.random() * 1100);
     }
   }
   return { status: lastStatus, usedUrl, finalUrl, authed: false, error: lastErr?.message || "auth/999/guest" };
 }
 
-/**
- * If currently on a Sales Navigator person page, hop to the public LinkedIn profile (/in/...).
- * Returns { moved: boolean, publicUrl?: string }
- */
 async function moveToPublicProfileIfSalesNav(page) {
   const url = page.url();
   if (!/linkedin\.com\/sales\/people\//i.test(url)) return { moved: false };
-
-  // Try to find a public profile link on the page
   const candidates = [
     'a[href*="linkedin.com/in/"]',
     'a[data-anonymize="profile-link"]',
     'a:has-text("View LinkedIn Profile")',
     'a[href^="https://www.linkedin.com/in/"]',
   ];
-
   for (const sel of candidates) {
     try {
       const loc = page.locator(sel).first();
@@ -278,8 +302,22 @@ async function moveToPublicProfileIfSalesNav(page) {
   return { moved: false };
 }
 
+async function humanizePage(page) {
+  try {
+    const hops = 2 + Math.floor(Math.random()*3);
+    for (let i = 0; i < hops; i++) {
+      await page.waitForTimeout(300 + Math.random()*600);
+      try { await page.mouse.wheel(0, 120 + Math.random()*180); } catch {}
+    }
+    for (let i = 0; i < 3; i++) {
+      await page.waitForTimeout(150 + Math.random()*350);
+      try { await page.mouse.move(200 + Math.random()*300, 150 + Math.random()*200, { steps: 2 + Math.floor(Math.random()*3) }); } catch {}
+    }
+  } catch {}
+}
+
 // =========================
-// Connect flow helpers
+// Connect flow
 // =========================
 async function detectRelationshipStatus(page) {
   const checks = [
@@ -457,7 +495,7 @@ async function sendConnectionRequest(page, note) {
 }
 
 // =========================
-// Message flow helpers
+// Message flow
 // =========================
 async function openMessageDialog(page) {
   const buttons = [
@@ -469,7 +507,6 @@ async function openMessageDialog(page) {
     try {
       if (await btn.first().isVisible({ timeout: 1000 }).catch(() => false)) {
         await btn.first().click({ timeout: 4000 }); await microDelay();
-        // Wait for composer: dialog OR side panel
         const ready = await Promise.race([
           page.getByRole("dialog").waitFor({ timeout: 4000 }).then(() => true).catch(() => false),
           page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 4000 }).then(() => true).catch(() => false),
@@ -482,8 +519,7 @@ async function openMessageDialog(page) {
 }
 
 async function typeIntoComposer(page, text) {
-  const limited = String(text).slice(0, 3000); // message cap safety
-  // Common contenteditable targets
+  const limited = String(text).slice(0, 3000);
   const editors = [
     page.locator('.msg-form__contenteditable[contenteditable="true"]'),
     page.locator('[role="textbox"][contenteditable="true"]'),
@@ -496,7 +532,6 @@ async function typeIntoComposer(page, text) {
       const handle = ed.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await handle.click({ timeout: 3000 }).catch(()=>{});
-        // Prefer fill for textarea; for contenteditable, use keyboard type
         const tag = await handle.evaluate(el => el.tagName.toLowerCase()).catch(() => "");
         if (tag === "textarea" || tag === "input") {
           await handle.fill(limited, { timeout: 4000 });
@@ -521,11 +556,10 @@ async function clickSendInComposer(page) {
     try {
       if (await s.first().isVisible({ timeout: 1200 }).catch(() => false)) {
         await s.first().click({ timeout: 4000 }); await microDelay();
-        // Wait for a small confirmation or textarea clearing
         const sent = await Promise.race([
           page.locator('div:has-text("Message sent")').waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
           page.locator('.msg-form__contenteditable[contenteditable="true"]').evaluate(el => (el.innerText || "").trim().length === 0).catch(() => false),
-          sleep(1200).then(() => true), // fallback optimistic
+          sleep(1200).then(() => true),
         ]);
         if (sent) return true;
       }
@@ -535,7 +569,6 @@ async function clickSendInComposer(page) {
 }
 
 async function sendMessageFlow(page, messageText) {
-  // Ensure we have the Message CTA
   const rs = await detectRelationshipStatus(page);
   if (rs.status !== "connected") {
     return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
@@ -549,28 +582,35 @@ async function sendMessageFlow(page, messageText) {
 
   await microDelay();
   const sent = await clickSendInComposer(page);
-  if (sent) {
-    return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent" };
-  }
+  if (sent) return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent" };
+
   return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Failed to send message" };
 }
 
 // =========================
-// Job handlers
+/** Job handlers */
 // =========================
 async function handleSendConnection(job) {
   const { payload } = job || {};
   if (!payload) throw new Error("Job has no payload");
-  const profileUrl = payload.profileUrl;
+
+  // Accept profileUrl, publicIdentifier, or SalesNav inputs
+  let targetUrl = payload.profileUrl || null;
+  if (!targetUrl && payload.publicIdentifier) {
+    targetUrl = `https://www.linkedin.com/in/${encodeURIComponent(payload.publicIdentifier)}`;
+  }
   const note = payload.note || null;
   const cookieBundle = payload.cookieBundle || {};
   const salesNavUrl = payload.salesNavUrl || null;
   const salesProfileUrn = payload.salesProfileUrn || null;
-  if (!profileUrl && !salesNavUrl && !salesProfileUrn) throw new Error("payload.profileUrl or salesNavUrl/salesProfileUrn required");
+
+  if (!targetUrl && !salesNavUrl && !salesProfileUrn) {
+    throw new Error("payload.profileUrl or publicIdentifier or salesNavUrl/salesProfileUrn required");
+  }
 
   if (SOFT_MODE) {
     await throttle.reserve("linkedin.com", "SOFT send_connection"); await microDelay(); throttle.success("linkedin.com");
-    return { mode: "soft", profileUrl, noteUsed: note, message: "Soft mode success (no browser launched).", at: new Date().toISOString() };
+    return { mode: "soft", profileUrl: targetUrl, noteUsed: note, message: "Soft mode success (no browser).", at: new Date().toISOString() };
   }
 
   await throttle.reserve("linkedin.com", "SEND_CONNECTION");
@@ -580,13 +620,10 @@ async function handleSendConnection(job) {
     ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    const targetUrl = profileUrl || salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`;
-    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: 4, salesNavUrl, salesProfileUrn });
-    await microDelay();
-
+    const nav = await navigateLinkedInWithRetries(page, targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`), { attempts: 4, salesNavUrl, salesProfileUrn });
     if (!nav.authed) {
       const result = {
-        mode: "real", profileUrl: profileUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
+        mode: "real", profileUrl: targetUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
         httpStatus: nav.status, pageTitle: await page.title().catch(() => null),
         relationshipStatus: "not_connected", actionTaken: "unavailable", details: "Not authenticated (guest/authwall). Refresh cookies.",
         at: new Date().toISOString(),
@@ -596,16 +633,16 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // If we landed on Sales Nav, hop to public profile
+    // If on Sales Nav, hop to public profile, then humanize a bit
     const hop = await moveToPublicProfileIfSalesNav(page);
-    await microDelay();
+    await humanizePage(page);
 
     const connectOutcome = await sendConnectionRequest(page, note);
     await microDelay();
 
     const result = {
       mode: "real",
-      profileUrl: profileUrl || hop.publicUrl || null,
+      profileUrl: targetUrl || hop.publicUrl || null,
       usedUrl: nav.usedUrl,
       finalUrl: hop.publicUrl || nav.finalUrl || page.url(),
       noteUsed: note,
@@ -621,7 +658,7 @@ async function handleSendConnection(job) {
     await browser.close().catch(() => {});
     if (connectOutcome.actionTaken === "sent" || connectOutcome.actionTaken === "sent_maybe") throttle.success("linkedin.com");
     else if (connectOutcome.actionTaken === "failed_to_send" || connectOutcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
-    else throttle.success("linkedin.com"); // connected/pending already
+    else throttle.success("linkedin.com");
 
     return result;
   } catch (e) {
@@ -642,17 +679,24 @@ async function handleSendConnection(job) {
 async function handleSendMessage(job) {
   const { payload } = job || {};
   if (!payload) throw new Error("Job has no payload");
-  const profileUrl = payload.profileUrl;
+
+  let targetUrl = payload.profileUrl || null;
+  if (!targetUrl && payload.publicIdentifier) {
+    targetUrl = `https://www.linkedin.com/in/${encodeURIComponent(payload.publicIdentifier)}`;
+  }
   const messageText = payload.message;
   const cookieBundle = payload.cookieBundle || {};
   const salesNavUrl = payload.salesNavUrl || null;
   const salesProfileUrn = payload.salesProfileUrn || null;
+
   if (!messageText) throw new Error("payload.message required");
-  if (!profileUrl && !salesNavUrl && !salesProfileUrn) throw new Error("payload.profileUrl or salesNavUrl/salesProfileUrn required");
+  if (!targetUrl && !salesNavUrl && !salesProfileUrn) {
+    throw new Error("payload.profileUrl or publicIdentifier or salesNavUrl/salesProfileUrn required");
+  }
 
   if (SOFT_MODE) {
     await throttle.reserve("linkedin.com", "SOFT send_message"); await microDelay(); throttle.success("linkedin.com");
-    return { mode: "soft", profileUrl, messageUsed: messageText, message: "Soft mode success (no browser launched).", at: new Date().toISOString() };
+    return { mode: "soft", profileUrl: targetUrl, messageUsed: messageText, message: "Soft mode success (no browser).", at: new Date().toISOString() };
   }
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
@@ -662,13 +706,10 @@ async function handleSendMessage(job) {
     ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    const targetUrl = profileUrl || salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`;
-    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: 4, salesNavUrl, salesProfileUrn });
-    await microDelay();
-
+    const nav = await navigateLinkedInWithRetries(page, targetUrl || (salesNavUrl || `https://www.linkedin.com/sales/people/${encodeURIComponent(salesProfileUrn)}`), { attempts: 4, salesNavUrl, salesProfileUrn });
     if (!nav.authed) {
       const result = {
-        mode: "real", profileUrl: profileUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
+        mode: "real", profileUrl: targetUrl || null, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
         httpStatus: nav.status, pageTitle: await page.title().catch(() => null),
         relationshipStatus: "unknown", actionTaken: "unavailable", details: "Not authenticated (guest/authwall). Refresh cookies.",
         at: new Date().toISOString(),
@@ -678,16 +719,15 @@ async function handleSendMessage(job) {
       return result;
     }
 
-    // If we landed on Sales Nav, hop to public profile
     const hop = await moveToPublicProfileIfSalesNav(page);
-    await microDelay();
+    await humanizePage(page);
 
     const outcome = await sendMessageFlow(page, messageText);
     await microDelay();
 
     const result = {
       mode: "real",
-      profileUrl: profileUrl || hop.publicUrl || null,
+      profileUrl: targetUrl || hop.publicUrl || null,
       usedUrl: nav.usedUrl,
       finalUrl: hop.publicUrl || nav.finalUrl || page.url(),
       messageUsed: messageText,
@@ -704,6 +744,7 @@ async function handleSendMessage(job) {
     if (outcome.actionTaken === "sent") throttle.success("linkedin.com");
     else if (outcome.actionTaken?.startsWith("failed") || outcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
     else throttle.success("linkedin.com");
+
     return result;
   } catch (e) {
     try {
@@ -726,7 +767,6 @@ async function handleSendMessage(job) {
 async function processOne() {
   let next;
   try {
-    // Supports both connection + message jobs (backend may return either)
     next = await apiPost("/jobs/next", { types: ["SEND_CONNECTION", "SEND_MESSAGE"] });
   } catch (e) {
     logFetchError("jobs/next", e);
@@ -740,12 +780,9 @@ async function processOne() {
     let result = null;
 
     switch (job.type) {
-      case "SEND_CONNECTION":
-        result = await handleSendConnection(job); break;
-    case "SEND_MESSAGE":
-        result = await handleSendMessage(job); break;
-      default:
-        result = { note: `Unhandled job type: ${job.type}` }; break;
+      case "SEND_CONNECTION": result = await handleSendConnection(job); break;
+      case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
+      default: result = { note: `Unhandled job type: ${job.type}` }; break;
     }
 
     try {
@@ -765,7 +802,7 @@ async function processOne() {
 }
 
 async function mainLoop() {
-  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} Soft mode: ${SOFT_MODE}`);
+  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
   if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
 
   try {

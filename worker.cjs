@@ -1,4 +1,5 @@
 // worker.cjs — LinqBridge Worker (final, CommonJS, hardened against HTTP 999)
+// Runs fine on headless servers. Includes tracing + screenshot on failures.
 
 // =========================
 // Env & Config
@@ -81,7 +82,7 @@ async function apiPostNoSecret(path, body) {
 }
 
 // =========================
-// Playwright helpers (anti-999 hardening)
+// Playwright helpers (anti-999 hardening + debug tracing)
 // =========================
 
 /**
@@ -90,6 +91,7 @@ async function apiPostNoSecret(path, body) {
  * - removes navigator.webdriver
  * - sets cookies (JSESSIONID quoted)
  * - blocks heavy/noisy resources
+ * - attaches console logging
  */
 async function createBrowserContext(cookieBundle, headless = true) {
   if (!chromium) {
@@ -192,6 +194,13 @@ async function createBrowserContext(cookieBundle, headless = true) {
   page.setDefaultTimeout(20000);
   page.setDefaultNavigationTimeout(30000);
 
+  // Pipe page console logs to worker logs
+  page.on("console", (msg) => {
+    try {
+      console.log("[page console]", msg.type(), msg.text());
+    } catch {}
+  });
+
   return { browser, context, page };
 }
 
@@ -200,6 +209,7 @@ async function createBrowserContext(cookieBundle, headless = true) {
  * - Appends a benign query param
  * - Falls back to m.linkedin.com profile if needed
  * - Soft refresh via /feed between attempts
+ * Returns: { status, usedUrl }
  */
 async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 3 } = {}) {
   const addParam = (u) => {
@@ -217,7 +227,8 @@ async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 3 } = {}) 
     rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/"), // mobile fallback
   ];
 
-  let lastErr;
+  let lastErr, lastStatus = null, usedUrl = null;
+
   for (let i = 0; i < attempts; i++) {
     const target = urlCandidates[Math.min(i, urlCandidates.length - 1)];
     try {
@@ -226,17 +237,18 @@ async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 3 } = {}) 
         timeout: 25000,
       });
 
-      const status = resp ? resp.status() : null;
+      usedUrl = target;
+      lastStatus = resp ? resp.status() : null;
 
-      if (status && status >= 200 && status < 400) {
+      if (lastStatus && lastStatus >= 200 && lastStatus < 400) {
         const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
         if (title.includes("sign in") || title.includes("authwall")) {
           throw new Error("Hit auth wall");
         }
-        return; // success
+        return { status: lastStatus, usedUrl };
       }
 
-      throw new Error(`Nav bad status ${status || "none"}`);
+      throw new Error(`Nav bad status ${lastStatus ?? "none"}`);
     } catch (e) {
       lastErr = e;
       // jittered backoff
@@ -258,7 +270,7 @@ async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 3 } = {}) 
 /**
  * Process a single SEND_CONNECTION job.
  * In SOFT_MODE: we do not open a browser—just pretend success and return a result.
- * In REAL mode: launch Chromium (Playwright), set cookies, visit page (hardened), and return a result.
+ * In REAL mode: hardened context + navigation with retries/fallbacks + tracing.
  */
 // =========================
 async function handleSendConnection(job) {
@@ -281,7 +293,7 @@ async function handleSendConnection(job) {
     };
   }
 
-  // Real mode: hardened context + navigation with retries/fallbacks
+  // Real mode
   let browser;
   let context;
   let page;
@@ -289,34 +301,52 @@ async function handleSendConnection(job) {
   try {
     ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
 
+    // Start tracing for post-mortem / debugging even in headless
+    await context.tracing.start({ screenshots: true, snapshots: false });
+
     // Optional warm-up to stabilize session before hitting profile
     try {
       await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(1200);
     } catch {}
 
-    await navigateLinkedInWithRetries(page, profileUrl, { attempts: 3 });
+    const { status: httpStatus, usedUrl } = await navigateLinkedInWithRetries(page, profileUrl, { attempts: 3 });
 
     await sleep(1500); // small human-ish pause
 
-    const status = page.response()?.status?.() ?? null; // may be undefined if Playwright doesn't keep last resp
     const result = {
       mode: "real",
       profileUrl,
+      usedUrl,
       noteUsed: note,
-      httpStatus: status,
+      httpStatus,
       pageTitle: await page.title().catch(() => null),
       message: "Visited profile in real mode.",
       at: new Date().toISOString(),
     };
 
+    // Stop tracing on success
+    try {
+      await context.tracing.stop({ path: "/tmp/trace.zip" });
+    } catch {}
+
     await browser.close().catch(() => {});
     return result;
   } catch (e) {
+    // Try to capture evidence before bubbling up
+    try {
+      const title = await page?.title().catch(() => null);
+      const html = await page?.content().catch(() => null);
+      if (title) console.log("[debug] page.title:", title);
+      if (html) console.log("[debug] page.content length:", html.length);
+      await page?.screenshot?.({ path: "/tmp/last-error.png", fullPage: false }).catch(() => {});
+      await context?.tracing?.stop({ path: "/tmp/trace-failed.zip" }).catch(() => {});
+    } catch {}
     try {
       await browser?.close();
     } catch {}
-    // Let the caller fail the job
+
+    // Fail the job with a clear message
     throw new Error(`REAL mode failed: ${e.message}`);
   }
 }

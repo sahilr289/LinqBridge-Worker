@@ -8,22 +8,21 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy manifests first to leverage Docker layer cache
+# Copy manifests first to leverage layer cache
 COPY package*.json ./
 
-# If lockfile exists use ci, otherwise install
+# If lockfile exists, do deterministic install; else fallback
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# Install browsers + any missing system deps (safe to run even after apt)
+# Install browsers + any missing system deps
 RUN npx playwright install --with-deps chromium
 
-# Copy the rest of your app (including worker.cjs)
+# Copy the rest (includes worker.cjs)
 COPY . .
 
 ENV NODE_ENV=production
 ENV SOFT_MODE=false
 ENV HEADLESS=false
-# optional: slow down actions a bit so you can see them in headed mode
 ENV SLOWMO_MS=50
 
 # Run headed under a virtual display

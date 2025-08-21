@@ -1,26 +1,27 @@
 // worker.cjs — LinqBridge Worker (FINAL, headed-ready)
 // Playwright + anti-999 hardening + Connect/Message flows + human pacing + per-domain throttle.
-// Includes a tiny health server so PaaS won’t restart the container.
+// Health server is DISABLED by default; enable by setting ENABLE_HEALTH=true.
 
 // -------------------------
-// Health server (optional but helpful on PaaS)
+// Optional health server (off by default)
 // -------------------------
-try {
-  const http = require("http");
-  const PORT = process.env.PORT || 3000;
-  http
-    .createServer((req, res) => {
-      if (req.url === "/" || req.url === "/health") {
-        res.writeHead(200, { "content-type": "text/plain" });
-        res.end("OK\n");
-      } else {
-        res.writeHead(404);
-        res.end();
-      }
-    })
-    .listen(PORT, () => console.log(`[health] listening on :${PORT}`));
-} catch (e) {
-  console.log("[health] server not started:", e?.message || e);
+if (process.env.ENABLE_HEALTH === "true") {
+  try {
+    const http = require("http");
+    const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "3001", 10);
+    http
+      .createServer((req, res) => {
+        if (req.url === "/" || req.url === "/health") {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("OK\n");
+        } else {
+          res.writeHead(404); res.end();
+        }
+      })
+      .listen(HEALTH_PORT, () => console.log(`[health] listening on :${HEALTH_PORT}`));
+  } catch (e) {
+    console.log("[health] server not started:", e?.message || e);
+  }
 }
 
 // =========================
@@ -29,7 +30,7 @@ try {
 const API_BASE = process.env.API_BASE || "https://calm-rejoicing-linqbridge.up.railway.app";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
-// Headed by default so you can watch live locally or via video on PaaS (xvfb)
+// Headed by default so you can watch live via noVNC
 const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 
@@ -148,8 +149,7 @@ async function createBrowserContext(cookieBundle, headless = true) {
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu",
-      // minimal flags; avoid odd disable-feature combos
+      "--disable-gpu"
     ],
   });
 
@@ -165,7 +165,7 @@ async function createBrowserContext(cookieBundle, headless = true) {
     viewport: { width: vw, height: vh },
     deviceScaleFactor: 1,
     javaScriptEnabled: true,
-    // Always record video; useful when headed on PaaS (xvfb)
+    // Record videos so you can download later from /tmp/pw-video
     recordVideo: { dir: "/tmp/pw-video" },
   });
 

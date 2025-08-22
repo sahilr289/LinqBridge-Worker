@@ -1,10 +1,48 @@
+# deps & package managers
 node_modules
-npm-debug.log
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# VCS & OS cruft
 .git
 .gitignore
 .DS_Store
-tmp
-*.log
-pw-report
+.vscode/
+.idea/
+
+# env / secrets (never bake these)
+.env
+.env.*
+
+# build artifacts / bundles (if any)
+dist/
+build/
+coverage/
+
+# Playwright artifacts
 pw-*
-/tmp/pw-video
+pw-report/
+playwright-report/
+test-results/
+trace*.zip
+last-error.png
+pw-video/
+ms-playwright/
+
+# logs & temps
+*.log
+tmp/
+temp/
+
+# local tokens/session (avoid baking auth)
+auth-state.json
+
+# misc (if present from earlier tools)
+replit.nix
+.replit
+
+# (worker doesn’t need local DB files in image)
+*.sqlite
+*.db
+data/

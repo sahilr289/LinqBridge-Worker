@@ -1,6 +1,6 @@
 // worker.cjs — LinqBridge Worker (PUBLIC LINKEDIN ONLY, headed-ready)
 // - Interactive login to personal LinkedIn only (no Sales Navigator).
-// - Persists session (storageState) after you complete login/2FA once.
+// - Persists session (storageState) after you complete login/2FA once (per-user).
 // - Anti-999 navigation, Connect & Message flows, human pacing, per-domain throttle.
 // - Health server disabled by default (noVNC should use the platform port).
 
@@ -54,16 +54,26 @@ const THROTTLE_JITTER_MAX_MS = parseInt(process.env.THROTTLE_JITTER_MAX_MS || "3
 // Session persistence / interactive login
 const path = require("path");
 const fs = require("fs");
-const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || "/app/auth-state.json";
+const STORAGE_STATE_DIR = process.env.STORAGE_STATE_DIR || "/app/state";
 const FORCE_RELOGIN = (/^(true|1|yes)$/i).test(process.env.FORCE_RELOGIN || "false");
 const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "true");
 const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10); // 5 min
+const DEBUG_PAGE_CONSOLE = (/^(true|1|yes)$/i).test(process.env.DEBUG_PAGE_CONSOLE || "false");
+
+// Ensure state dir exists
+try { fs.mkdirSync(STORAGE_STATE_DIR, { recursive: true }); } catch {}
+
+// Per-user state file
+function storagePathFor(userId = "default") {
+  const safe = String(userId).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80) || "default";
+  return path.join(STORAGE_STATE_DIR, `${safe}.json`);
+}
 
 // Lazy import
 let chromium = null;
 
 // =========================
-// Small Utils
+/* Small Utils */
 // =========================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -75,10 +85,10 @@ function logFetchError(where, err) {
   console.error(`[worker] ${where} fetch failed:`, code, err?.message || err);
 }
 
-function apiUrl(path) { return path.startsWith("/") ? `${API_BASE}${path}` : `${API_BASE}/${path}`; }
+function apiUrl(p) { return p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`; }
 
-async function apiGet(path) {
-  const res = await fetch(apiUrl(path), {
+async function apiGet(p) {
+  const res = await fetch(apiUrl(p), {
     method: "GET",
     headers: { "x-worker-secret": WORKER_SHARED_SECRET },
     signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
@@ -89,12 +99,12 @@ async function apiGet(path) {
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
     return json;
   } catch {
-    throw new Error(`GET ${path} non-JSON or error ${res.status}: ${text}`);
+    throw new Error(`GET ${p} non-JSON or error ${res.status}: ${text}`);
   }
 }
 
-async function apiPost(path, body) {
-  const res = await fetch(apiUrl(path), {
+async function apiPost(p, body) {
+  const res = await fetch(apiUrl(p), {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SHARED_SECRET },
     body: JSON.stringify(body || {}),
@@ -106,12 +116,12 @@ async function apiPost(path, body) {
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
     return json;
   } catch {
-    throw new Error(`POST ${path} non-JSON or error ${res.status}: ${text}`);
+    throw new Error(`POST ${p} non-JSON or error ${res.status}: ${text}`);
   }
 }
 
 // =========================
-// Per-domain Throttle
+/* Per-domain Throttle */
 // =========================
 class DomainThrottle {
   constructor() { this.state = new Map(); } // domain -> { lastActionAt, events: number[], cooldownUntil }
@@ -148,30 +158,27 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers (PUBLIC ONLY)
+/* Playwright helpers (PUBLIC ONLY) */
 // =========================
-async function createBrowserContext(cookieBundle, headless = true) {
+async function createBrowserContext(cookieBundle, headless, storagePath) {
   if (!chromium) ({ chromium } = require("playwright"));
 
   const browser = await chromium.launch({
     headless,
     slowMo: SLOWMO_MS,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu"
-    ],
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
   });
 
   const vw = 1280 + Math.floor(Math.random() * 192); // 1280–1471
   const vh = 720 + Math.floor(Math.random() * 160);  // 720–879
 
-  // Use persisted session if available and not forcing re-login
-  const storageStateOpt = (!FORCE_RELOGIN && fs.existsSync(STORAGE_STATE_PATH))
-    ? STORAGE_STATE_PATH
+  const storageStateOpt = (!FORCE_RELOGIN && storagePath && fs.existsSync(storagePath))
+    ? storagePath
     : undefined;
 
   const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0.0.0 Safari/537.36",
     locale: "en-US",
     timezoneId: "America/Los_Angeles",
     colorScheme: "light",
@@ -182,13 +189,24 @@ async function createBrowserContext(cookieBundle, headless = true) {
     storageState: storageStateOpt,
   });
 
-  // Light anti-detection shims
+  await context.setExtraHTTPHeaders({
+    "accept-language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"',
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-mobile": "?0",
+    "upgrade-insecure-requests": "1"
+  });
+
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     try {
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
       Object.defineProperty(navigator, "language", { get: () => "en-US" });
       Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      Object.defineProperty(navigator, "userAgent", {
+        get: () =>
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0.0.0 Safari/537.36"
+      });
       const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
       if (originalQuery) {
         navigator.permissions.query = (p) =>
@@ -230,7 +248,6 @@ async function createBrowserContext(cookieBundle, headless = true) {
   }
   if (cookies.length) await context.addCookies(cookies);
 
-  // Allow LinkedIn/LICDN; trim obvious 3P trackers
   await context.route("**/*", (route) => {
     const url = route.request().url();
     try {
@@ -245,10 +262,12 @@ async function createBrowserContext(cookieBundle, headless = true) {
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
   page.setDefaultNavigationTimeout(30000);
-  page.on("console", (msg) => { try { console.log("[page console]", msg.type(), msg.text()); } catch {} });
+  if (DEBUG_PAGE_CONSOLE) {
+    page.on("console", (msg) => { try { console.log("[page console]", msg.type(), msg.text()); } catch {} });
+  }
   try { await page.bringToFront(); } catch {}
 
-  return { browser, context, page };
+  return { browser, context, page, storagePath };
 }
 
 function withParams(u, extra = {}) {
@@ -285,7 +304,6 @@ async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 4 } = {}) 
       usedUrl = target;
       lastStatus = resp ? resp.status() : null;
 
-      // tiny human jitter
       try { await page.mouse.move(30 + Math.random()*100, 20 + Math.random()*80, { steps: 3 }); } catch {}
       await page.waitForTimeout(700 + Math.random() * 900);
 
@@ -336,17 +354,18 @@ async function cookieDiag(context) {
   };
 }
 
-async function saveStorageState(context) {
+async function saveStorageState(context, storagePath) {
   try {
-    await fs.promises.mkdir(path.dirname(STORAGE_STATE_PATH), { recursive: true }).catch(() => {});
-    await context.storageState({ path: STORAGE_STATE_PATH });
-    console.log("[auth] storageState saved to", STORAGE_STATE_PATH);
+    if (!storagePath) return;
+    await fs.promises.mkdir(path.dirname(storagePath), { recursive: true }).catch(() => {});
+    await context.storageState({ path: storagePath });
+    console.log("[auth] storageState saved to", storagePath);
   } catch (e) {
     console.log("[auth] storageState save failed:", e?.message || e);
   }
 }
 
-async function ensureAuthenticated(context, page) {
+async function ensureAuthenticated(context, page, storagePath) {
   const before = await cookieDiag(context);
 
   // Desktop feed
@@ -354,7 +373,7 @@ async function ensureAuthenticated(context, page) {
     const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 });
     const s = r ? r.status() : null;
     if (s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
-      await saveStorageState(context);
+      await saveStorageState(context, storagePath);
       return { ok: true, via: "desktop", status: s, url: page.url(), diag: before };
     }
   } catch {}
@@ -364,7 +383,7 @@ async function ensureAuthenticated(context, page) {
     const r = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 });
     const s = r ? r.status() : null;
     if (s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
-      await saveStorageState(context);
+      await saveStorageState(context, storagePath);
       return { ok: true, via: "mobile", status: s, url: page.url(), diag: before };
     }
   } catch {}
@@ -387,7 +406,7 @@ async function ensureAuthenticated(context, page) {
         return r ? r.status : null;
       }, csrf);
       if (code && code >= 200 && code < 400) {
-        await saveStorageState(context);
+        await saveStorageState(context, storagePath);
         return { ok: true, via: "voyager-api", status: code, url: page.url(), diag: before };
       }
     }
@@ -396,19 +415,20 @@ async function ensureAuthenticated(context, page) {
   return { ok: false, reason: "guest_or_authwall", url: page.url(), diag: before };
 }
 
-async function interactiveLogin(context, page) {
+async function interactiveLogin(context, page, storagePath) {
   if (!ALLOW_INTERACTIVE_LOGIN) return { ok: false, reason: "interactive_disabled" };
 
   console.log("[auth] interactive login: navigate to LinkedIn login and complete username + password + 2FA.");
   const deadline = Date.now() + INTERACTIVE_LOGIN_TIMEOUT_MS;
 
-  // Drive to public login (no Sales Nav)
   try { await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
+
+  // Poll until authwall disappears (user finishes 2FA on phone)
   while (Date.now() < deadline) {
     await sleep(1500);
     const ok = !(await isAuthWalledOrGuest(page));
     if (ok) {
-      await saveStorageState(context);
+      await saveStorageState(context, storagePath);
       console.log("[auth] interactive login success; session persisted.");
       return { ok: true, via: "interactive", url: page.url() };
     }
@@ -417,7 +437,7 @@ async function interactiveLogin(context, page) {
 }
 
 // =========================
-// Connect flow
+/* Connect flow */
 // =========================
 async function detectRelationshipStatus(page) {
   const checks = [
@@ -595,7 +615,7 @@ async function sendConnectionRequest(page, note) {
 }
 
 // =========================
-// Message flow
+/* Message flow */
 // =========================
 async function openMessageDialog(page) {
   const buttons = [
@@ -665,6 +685,29 @@ async function clickSendInComposer(page) {
       }
     } catch {}
   }
+
+  // Fallback keystrokes
+  try {
+    const editor = page.locator('.msg-form__contenteditable[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea').first();
+    if (await editor.isVisible({ timeout: 600 }).catch(() => false)) {
+      await editor.press("Enter").catch(()=>{});
+      await microDelay();
+      const sentByEnter = await Promise.race([
+        page.locator('div:has-text("Message sent")').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
+        sleep(1200).then(() => true),
+      ]);
+      if (sentByEnter) return true;
+
+      await editor.press("Control+Enter").catch(()=>{});
+      await microDelay();
+      const sentByCtrlEnter = await Promise.race([
+        page.locator('div:has-text("Message sent")').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
+        sleep(1200).then(() => true),
+      ]);
+      if (sentByCtrlEnter) return true;
+    }
+  } catch {}
+
   return false;
 }
 
@@ -688,8 +731,57 @@ async function sendMessageFlow(page, messageText) {
 }
 
 // =========================
-// Job handlers (PUBLIC ONLY)
+/* Job handlers */
 // =========================
+async function handleAuthCheck(job) {
+  // Purpose: open public LinkedIn in headed mode, let user finish login/2FA,
+  // persist per-user storageState for future jobs.
+  const { payload } = job || {};
+  const userId = payload?.userId || "default";
+  const cookieBundle = payload?.cookieBundle || null; // usually not provided for AUTH_CHECK
+
+  const statePath = storagePathFor(userId);
+
+  // Interactive AUTH flow ignores SOFT_MODE (we want a real browser)
+  let browser, context, page, videoHandle;
+  try {
+    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS, statePath));
+    videoHandle = page.video?.();
+
+    // Quick pass: already authed?
+    let auth = await ensureAuthenticated(context, page, statePath);
+    if (!auth.ok) {
+      const inter = await interactiveLogin(context, page, statePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, statePath);
+    }
+
+    const ok = !!auth.ok;
+    const result = {
+      mode: "auth_check",
+      ok,
+      via: auth.via || "unknown",
+      finalUrl: auth.url || (await page.url().catch(() => null)),
+      details: ok ? "Authenticated and storageState saved." : (auth.reason || "Not authenticated"),
+      at: new Date().toISOString(),
+      storagePath: statePath,
+    };
+
+    await browser.close().catch(() => {});
+    if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
+
+    return result;
+  } catch (e) {
+    try { await browser?.close(); } catch {}
+    return {
+      mode: "auth_check",
+      ok: false,
+      error: e.message || String(e),
+      at: new Date().toISOString(),
+      storagePath: statePath,
+    };
+  }
+}
+
 async function handleSendConnection(job) {
   const { payload } = job || {};
   if (!payload) throw new Error("Job has no payload");
@@ -700,6 +792,8 @@ async function handleSendConnection(job) {
   }
   const note = payload.note || null;
   const cookieBundle = payload.cookieBundle || {};
+  const userId = payload.userId || "default";
+  const statePath = storagePathFor(userId);
 
   if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
 
@@ -712,15 +806,15 @@ async function handleSendConnection(job) {
 
   let browser, context, page, videoHandle;
   try {
-    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
+    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS, statePath));
     videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     // AUTH PREFLIGHT -> interactive public login if needed
-    let auth = await ensureAuthenticated(context, page);
+    let auth = await ensureAuthenticated(context, page, statePath);
     if (!auth.ok) {
-      const inter = await interactiveLogin(context, page);
-      if (inter.ok) auth = await ensureAuthenticated(context, page);
+      const inter = await interactiveLogin(context, page, statePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, statePath);
     }
     if (!auth.ok) {
       const result = {
@@ -810,6 +904,9 @@ async function handleSendMessage(job) {
   }
   const messageText = payload.message;
   const cookieBundle = payload.cookieBundle || {};
+  const userId = payload.userId || "default";
+  const statePath = storagePathFor(userId);
+
   if (!messageText) throw new Error("payload.message required");
   if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
 
@@ -822,15 +919,15 @@ async function handleSendMessage(job) {
 
   let browser, context, page, videoHandle;
   try {
-    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS));
+    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS, statePath));
     videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     // AUTH PREFLIGHT -> interactive public login if needed
-    let auth = await ensureAuthenticated(context, page);
+    let auth = await ensureAuthenticated(context, page, statePath);
     if (!auth.ok) {
-      const inter = await interactiveLogin(context, page);
-      if (inter.ok) auth = await ensureAuthenticated(context, page);
+      const inter = await interactiveLogin(context, page, statePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, statePath);
     }
     if (!auth.ok) {
       const result = {
@@ -853,7 +950,6 @@ async function handleSendMessage(job) {
       return result;
     }
 
-    // Navigate to public profile only
     const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: 4 });
     if (!nav.authed) {
       const result = {
@@ -911,12 +1007,12 @@ async function handleSendMessage(job) {
 }
 
 // =========================
-// Job loop
+/* Job loop */
 // =========================
 async function processOne() {
   let next;
   try {
-    next = await apiPost("/jobs/next", { types: ["SEND_CONNECTION", "SEND_MESSAGE"] });
+    next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE"] });
   } catch (e) {
     logFetchError("jobs/next", e);
     return;
@@ -929,6 +1025,7 @@ async function processOne() {
     let result = null;
 
     switch (job.type) {
+      case "AUTH_CHECK":     result = await handleAuthCheck(job); break;
       case "SEND_CONNECTION": result = await handleSendConnection(job); break;
       case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
       default: result = { note: `Unhandled job type: ${job.type}` }; break;
@@ -936,7 +1033,7 @@ async function processOne() {
 
     try {
       await apiPost(`/jobs/${job.id}/complete`, { result });
-      console.log(`[worker] Job ${job.id} done:`, result?.message || result?.details || result);
+      console.log(`[worker] Job ${job.id} done:`, result?.message || result?.details || result?.note || result);
     } catch (e) {
       logFetchError(`jobs/${job.id}/complete`, e);
     }

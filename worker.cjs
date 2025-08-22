@@ -1,19 +1,30 @@
 // worker.cjs — LinqBridge Worker (PUBLIC LINKEDIN ONLY, headed-ready)
 // - Interactive login to personal LinkedIn only (no Sales Navigator).
-// - Persists session (storageState) after login/2FA.
-// - Human pre-wander on feed, scrape About + current role (expanding "See more"), then Connect.
-// - No URL decorations (no trk/original_referer/lipi); minimal retries; per-domain throttle.
+// - Persists session (storageState) per user (email) after you complete login/2FA once.
+// - Anti-999 navigation, Connect & Message flows, human pacing, per-domain throttle.
+// - Scrapes "About" + current role before sending connection (as requested).
+// - Console noise reduction & optional tracker-block toggle.
 
+// -------------------------
+// Optional health server (off by default; enable with ENABLE_HEALTH=true)
+// -------------------------
 if (process.env.ENABLE_HEALTH === "true") {
   try {
     const http = require("http");
     const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "3001", 10);
-    http.createServer((req, res) => {
-      if (req.url === "/" || req.url === "/health") {
-        res.writeHead(200, { "content-type": "text/plain" }); res.end("OK\n");
-      } else { res.writeHead(404); res.end(); }
-    }).listen(HEALTH_PORT, () => console.log(`[health] listening on :${HEALTH_PORT}`));
-  } catch (e) { console.log("[health] server not started:", e?.message || e); }
+    http
+      .createServer((req, res) => {
+        if (req.url === "/" || req.url === "/health") {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("OK\n");
+        } else {
+          res.writeHead(404); res.end();
+        }
+      })
+      .listen(HEALTH_PORT, () => console.log(`[health] listening on :${HEALTH_PORT}`));
+  } catch (e) {
+    console.log("[health] server not started:", e?.message || e);
+  }
 }
 
 // =========================
@@ -22,13 +33,14 @@ if (process.env.ENABLE_HEALTH === "true") {
 const API_BASE = process.env.API_BASE || "https://calm-rejoicing-linqbridge.up.railway.app";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
+// Headed by default so you can watch via noVNC
 const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 
-const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true");
+const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "true"); // safe default
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
-// pacing
+// Human pacing knobs
 const MAX_ACTIONS_PER_HOUR = parseInt(process.env.MAX_ACTIONS_PER_HOUR || "35", 10);
 const MIN_GAP_MS = parseInt(process.env.MIN_GAP_MS || "25000", 10);
 const COOLDOWN_AFTER_SENT_MS = parseInt(process.env.COOLDOWN_AFTER_SENT_MS || "45000", 10);
@@ -37,27 +49,32 @@ const COOLDOWN_AFTER_FAIL_MS = parseInt(process.env.COOLDOWN_AFTER_FAIL_MS || "9
 const MICRO_DELAY_MIN_MS = parseInt(process.env.MICRO_DELAY_MIN_MS || "400", 10);
 const MICRO_DELAY_MAX_MS = parseInt(process.env.MICRO_DELAY_MAX_MS || "1200", 10);
 
-// humanization waits
-const FEED_AFTER_LOAD_WAIT_MS = parseInt(process.env.FEED_AFTER_LOAD_WAIT_MS || "4000", 10);
-const FEED_WANDER_MS = parseInt(process.env.FEED_WANDER_MS || "2000", 10);
-const PROFILE_AFTER_LOAD_WAIT_MS = parseInt(process.env.PROFILE_AFTER_LOAD_WAIT_MS || "4000", 10);
-const POST_CONNECT_HOLD_MS = parseInt(process.env.POST_CONNECT_HOLD_MS || "2000", 10);
-
-// nav retries (keep tight)
-const MAX_NAV_RETRIES = parseInt(process.env.MAX_NAV_RETRIES || "2", 10);
-
 const THROTTLE_JITTER_MIN_MS = parseInt(process.env.THROTTLE_JITTER_MIN_MS || "1500", 10);
 const THROTTLE_JITTER_MAX_MS = parseInt(process.env.THROTTLE_JITTER_MAX_MS || "3500", 10);
 
-// Session persistence
+// Session persistence / interactive login
 const path = require("path");
 const fs = require("fs");
 const STORAGE_STATE_DIR = process.env.STORAGE_STATE_DIR || "/app/state";
-const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || path.join(STORAGE_STATE_DIR, "auth-state.json");
+const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || "/app/auth-state.json"; // fallback if userId not present
 const FORCE_RELOGIN = (/^(true|1|yes)$/i).test(process.env.FORCE_RELOGIN || "false");
 const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "true");
-const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10);
+const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10); // 5 min
 
+// Navigation param toggle
+const USE_NAV_PARAMS = !/^(false|0|no)$/i.test(process.env.USE_NAV_PARAMS || "true");
+
+// Console & network-noise toggles
+const QUIET_CONSOLE = !/^(false|0|no)$/i.test(process.env.QUIET_CONSOLE || "true"); // default quiet
+const ABORT_TRACKERS = /^(true|1|yes)$/i.test(process.env.ABORT_TRACKERS || "false"); // default let them load
+
+// Human flow timing (ms)
+const FEED_AFTER_LOAD_WAIT_MS = parseInt(process.env.FEED_AFTER_LOAD_WAIT_MS || "4000", 10);
+const FEED_WANDER_MS          = parseInt(process.env.FEED_WANDER_MS || "2000", 10);
+const PROFILE_AFTER_LOAD_WAIT_MS = parseInt(process.env.PROFILE_AFTER_LOAD_WAIT_MS || "4000", 10);
+const POST_CONNECT_HOLD_MS       = parseInt(process.env.POST_CONNECT_HOLD_MS || "2000", 10);
+
+// Lazy import
 let chromium = null;
 
 // =========================
@@ -108,11 +125,19 @@ async function apiPost(p, body) {
   }
 }
 
+function sanitizeForFilename(s="") {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+function statePathForUser(userId) {
+  if (!userId) return STORAGE_STATE_PATH;
+  return path.join(STORAGE_STATE_DIR, `${sanitizeForFilename(userId)}.json`);
+}
+
 // =========================
 // Per-domain Throttle
 // =========================
 class DomainThrottle {
-  constructor() { this.state = new Map(); }
+  constructor() { this.state = new Map(); } // domain -> { lastActionAt, events: number[], cooldownUntil }
   _get(domain) {
     if (!this.state.has(domain)) this.state.set(domain, { lastActionAt: 0, events: [], cooldownUntil: 0 });
     return this.state.get(domain);
@@ -146,28 +171,30 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers
+/** Playwright helpers (PUBLIC ONLY) */
 // =========================
-async function createBrowserContext(cookieBundle, headless = true, userKey = "default") {
+async function createBrowserContext(cookieBundle, headless = true, storageStatePath = undefined) {
   if (!chromium) ({ chromium } = require("playwright"));
-  await fs.promises.mkdir(STORAGE_STATE_DIR, { recursive: true }).catch(()=>{});
-  const userSafe = String(userKey).replace(/[^a-z0-9_\-\.]/gi, "_");
-  const userStatePath = path.join(STORAGE_STATE_DIR, `${userSafe}.json`);
-  const storageStateOpt = (!FORCE_RELOGIN && fs.existsSync(userStatePath))
-    ? userStatePath
-    : ((!FORCE_RELOGIN && fs.existsSync(STORAGE_STATE_PATH)) ? STORAGE_STATE_PATH : undefined);
 
   const browser = await chromium.launch({
     headless,
     slowMo: SLOWMO_MS,
-    args: ["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--enable-unsafe-swiftshader" // hush software WebGL warning
+    ],
   });
 
-  const vw = 1280 + Math.floor(Math.random() * 192);
-  const vh = 720 + Math.floor(Math.random() * 160);
+  const vw = 1280 + Math.floor(Math.random() * 192); // 1280–1471
+  const vh = 720 + Math.floor(Math.random() * 160);  // 720–879
+
+  const chosenPath = storageStatePath || STORAGE_STATE_PATH;
+  const useStored = (!FORCE_RELOGIN && fs.existsSync(chosenPath)) ? chosenPath : undefined;
 
   const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0.0.0 Safari/537.36",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "en-US",
     timezoneId: "America/Los_Angeles",
     colorScheme: "light",
@@ -175,7 +202,7 @@ async function createBrowserContext(cookieBundle, headless = true, userKey = "de
     deviceScaleFactor: 1,
     javaScriptEnabled: true,
     recordVideo: { dir: "/tmp/pw-video" },
-    storageState: storageStateOpt,
+    storageState: useStored,
   });
 
   await context.setExtraHTTPHeaders({
@@ -192,7 +219,10 @@ async function createBrowserContext(cookieBundle, headless = true, userKey = "de
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
       Object.defineProperty(navigator, "language", { get: () => "en-US" });
       Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-      Object.defineProperty(navigator, "userAgent", { get: () => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0.0.0 Safari/537.36" });
+      Object.defineProperty(navigator, "userAgent", {
+        get: () =>
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      });
       const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
       if (originalQuery) {
         navigator.permissions.query = (p) =>
@@ -201,45 +231,55 @@ async function createBrowserContext(cookieBundle, headless = true, userKey = "de
     } catch {}
   });
 
-  // Cookies
-  const expandDomains = (cookie) => ([
-    { ...cookie, domain: "linkedin.com" },
-    { ...cookie, domain: "www.linkedin.com" },
-    { ...cookie, domain: "m.linkedin.com" },
-  ]);
-  let cookies = [];
-  if (cookieBundle?.li_at) cookies = cookies.concat(expandDomains({ name: "li_at", value: cookieBundle.li_at, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
-  if (cookieBundle?.jsessionid) cookies = cookies.concat(expandDomains({ name: "JSESSIONID", value: `"${cookieBundle.jsessionid}"`, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
-  if (cookieBundle?.bcookie) cookies = cookies.concat(expandDomains({ name: "bcookie", value: cookieBundle.bcookie, path: "/", httpOnly: false, secure: true, sameSite: "None" }));
-  if (cookieBundle?.lang) cookies = cookies.concat(expandDomains({ name: "lang", value: cookieBundle.lang, path: "/", httpOnly: false, secure: true, sameSite: "None" }));
-  if (cookies.length) await context.addCookies(cookies);
-
-  // Allow linkedin/licdn; trim trackers
   await context.route("**/*", (route) => {
+    if (!ABORT_TRACKERS) return route.continue(); // default: let all requests through (reduces console spam)
+
     const url = route.request().url();
     try {
       const host = new URL(url).hostname.replace(/^www\./, "");
-      const isFirstParty = host.endsWith("linkedin.com") || host.endsWith("licdn.com");
-      if (isFirstParty) return route.continue();
+      const firstParty = host.endsWith("linkedin.com") || host.endsWith("licdn.com");
+      if (firstParty) return route.continue();
     } catch {}
-    if (/doubleclick|googletagmanager|adservice|facebook|hotjar|segment|optimizely/i.test(url)) return route.abort();
+    if (/doubleclick|googletagmanager|adservice|facebook|hotjar|segment|optimizely/i.test(url)) {
+      return route.abort();
+    }
     return route.continue();
   });
 
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
   page.setDefaultNavigationTimeout(30000);
-  page.on("console", (msg) => { try { console.log("[page console]", msg.type(), msg.text()); } catch {} });
+
+  // Quiet console (rate-limited errors; skip tracker noise)
+  let perNavErr = 0;
+  page.on("framenavigated", () => { perNavErr = 0; });
+  page.on("console", (msg) => {
+    if (!QUIET_CONSOLE) return console.log("[page console]", msg.type(), msg.text());
+    if (msg.type() !== "error") return;
+    const t = msg.text() || "";
+    if (
+      /ERR_BLOCKED_BY_CLIENT/i.test(t) ||
+      /apfc\/collect|li\/track|platform-telemetry/i.test(t) ||
+      /Clear-Site-Data/i.test(t) ||
+      /status of (403|429)/i.test(t)
+    ) return;
+    if (perNavErr++ < 12) console.warn("[page error]", t.slice(0, 300));
+  });
+
   try { await page.bringToFront(); } catch {}
 
-  async function saveState() {
-    try {
-      await context.storageState({ path: userStatePath });
-      console.log("[auth] storageState saved to", userStatePath);
-    } catch (e) { console.log("[auth] storageState save failed:", e?.message || e); }
-  }
+  return { browser, context, page, chosenStatePath: chosenPath };
+}
 
-  return { browser, context, page, saveState };
+function withParams(u, extra = {}) {
+  if (!USE_NAV_PARAMS) return u;
+  try {
+    const url = new URL(u);
+    if (!url.searchParams.get("trk")) url.searchParams.set("trk", "public_profile_nav");
+    url.searchParams.set("original_referer", "https://www.google.com/");
+    for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, String(v));
+    return url.toString();
+  } catch { return u; }
 }
 
 async function isAuthWalledOrGuest(page) {
@@ -251,48 +291,29 @@ async function isAuthWalledOrGuest(page) {
   } catch { return false; }
 }
 
-function stripQueryHash(u) {
-  try { const url = new URL(u); url.search = ""; url.hash = ""; return url.toString(); }
-  catch { return u; }
-}
+async function navigateLinkedInWithRetries(page, rawUrl, { attempts = 3 } = {}) {
+  const desktopRaw = rawUrl;
+  const desktopParam = withParams(rawUrl);
+  const desktopLipi  = USE_NAV_PARAMS ? withParams(rawUrl, { lipi: "urn-li-pi-" + Math.random().toString(36).slice(2) }) : null;
+  const mobile       = rawUrl && rawUrl.includes("/in/") ? rawUrl.replace("www.linkedin.com/in/", "m.linkedin.com/in/") : null;
 
-function cleanPublicProfileUrl(u) {
-  try {
-    const url = new URL(u);
-    const host = url.hostname.replace(/^www\./, "");
-    if (!/linkedin\.com$/i.test(host)) return u;
-    const m = url.pathname.match(/\/in\/([^\/\?\#]+)/i);
-    if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
-    return stripQueryHash(u);
-  } catch { return u; }
-}
+  const candidates = [desktopRaw, desktopParam, desktopLipi, mobile].filter(Boolean);
 
-async function navigateLinkedInWithRetries(page, rawUrl, { attempts = MAX_NAV_RETRIES } = {}) {
-  const clean = cleanPublicProfileUrl(rawUrl);
-  const stripped = stripQueryHash(rawUrl);
-  const mobile  = clean.replace("www.linkedin.com/in/", "m.linkedin.com/in/");
-
-  // Try: clean desktop -> stripped raw -> mobile clean
-  const candidates = [clean, stripped, mobile].filter((v, i, arr) => v && arr.indexOf(v) === i).slice(0, 3);
-
-  let lastErr = null, lastStatus = null, usedUrl = null, finalUrl = null;
+  let lastErr, lastStatus = null, usedUrl = null, finalUrl = null;
   for (let i = 0; i < Math.min(attempts, candidates.length); i++) {
     const target = candidates[i];
     try {
       const resp = await page.goto(target, { waitUntil: "domcontentloaded", timeout: 28000 });
       usedUrl = target;
       lastStatus = resp ? resp.status() : null;
+
+      // tiny human jitter
+      try { await page.mouse.move(30 + Math.random()*100, 20 + Math.random()*80, { steps: 3 }); } catch {}
+      await page.waitForTimeout(700 + Math.random() * 900);
+
+      const authed = !(await isAuthWalledOrGuest(page));
       finalUrl = page.url();
 
-      const title = (await page.title().catch(() => "")) || "";
-      const pageNotFound = /page not found|doesn['’]t exist|not found/i.test(title);
-
-      await page.waitForTimeout(700 + Math.random() * 900);
-      const authed = !(await isAuthWalledOrGuest(page));
-
-      if (pageNotFound || (lastStatus && [404, 410].includes(lastStatus))) {
-        return { status: lastStatus || 404, usedUrl, finalUrl, authed, error: "not_found" };
-      }
       if (lastStatus && lastStatus >= 200 && lastStatus < 400 && authed) {
         try { await page.mouse.wheel(0, 200 + Math.floor(Math.random()*200)); } catch {}
         await page.waitForTimeout(400 + Math.random()*600);
@@ -321,18 +342,6 @@ async function humanizePage(page) {
   } catch {}
 }
 
-// Feed wander (wait 4s, then ~2s scroll)
-async function wanderOnFeed(page) {
-  await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(()=>{});
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(()=>{});
-  await page.waitForTimeout(FEED_AFTER_LOAD_WAIT_MS);
-  const start = Date.now();
-  while (Date.now() - start < FEED_WANDER_MS) {
-    try { await page.mouse.wheel(0, within(150, 400)); } catch {}
-    await page.waitForTimeout(within(200, 450));
-  }
-}
-
 // -------------------------
 // Auth diagnostics + storageState
 // -------------------------
@@ -349,57 +358,78 @@ async function cookieDiag(context) {
   };
 }
 
-async function ensureAuthenticated(context, page, { avoidFeedNav = true } = {}) {
+async function saveStorageState(context, storagePath) {
+  try {
+    await fs.promises.mkdir(path.dirname(storagePath), { recursive: true }).catch(() => {});
+    await context.storageState({ path: storagePath });
+    console.log("[auth] storageState saved to", storagePath);
+  } catch (e) {
+    console.log("[auth] storageState save failed:", e?.message || e);
+  }
+}
+
+async function ensureAuthenticated(context, page, storagePath) {
   const before = await cookieDiag(context);
 
-  // Try voyager API first (no feed nav)
-  try {
-    const js = (await context.cookies("https://www.linkedin.com")).find(c => c.name === "JSESSIONID");
-    const csrf = js ? (js.value || "").replace(/^"|"$/g, "") : null;
-    if (avoidFeedNav && csrf) {
-      const code = await page.evaluate(async (csrfToken) => {
-        const r = await fetch("https://www.linkedin.com/voyager/api/me", {
-          headers: { "csrf-token": csrfToken, "x-restli-protocol-version": "2.0.0", "accept": "application/json" },
-          credentials: "include", method: "GET",
-        }).catch(() => null);
-        return r ? r.status : null;
-      }, csrf);
-      if (code && code >= 200 && code < 400) {
-        return { ok: true, via: "voyager-api", status: code, url: page.url(), diag: before };
-      }
-    }
-  } catch {}
-
-  // Single feed attempt (desktop)
+  // Desktop feed
   try {
     const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 });
     const s = r ? r.status() : null;
     if (s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
+      await saveStorageState(context, storagePath);
       return { ok: true, via: "desktop", status: s, url: page.url(), diag: before };
     }
   } catch {}
 
-  // One mobile attempt
+  // Mobile feed
   try {
     const r = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 });
     const s = r ? r.status() : null;
     if (s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
+      await saveStorageState(context, storagePath);
       return { ok: true, via: "mobile", status: s, url: page.url(), diag: before };
+    }
+  } catch {}
+
+  // Optional: API probe if CSRF available
+  try {
+    const js = (await context.cookies("https://www.linkedin.com")).find(c => c.name === "JSESSIONID");
+    const csrf = js ? (js.value || "").replace(/^"|"$/g, "") : null;
+    if (csrf) {
+      const code = await page.evaluate(async (csrfToken) => {
+        const r = await fetch("https://www.linkedin.com/voyager/api/me", {
+          headers: {
+            "csrf-token": csrfToken,
+            "x-restli-protocol-version": "2.0.0",
+            "accept": "application/json"
+          },
+          credentials: "include",
+          method: "GET",
+        }).catch(() => null);
+        return r ? r.status : null;
+      }, csrf);
+      if (code && code >= 200 && code < 400) {
+        await saveStorageState(context, storagePath);
+        return { ok: true, via: "voyager-api", status: code, url: page.url(), diag: before };
+      }
     }
   } catch {}
 
   return { ok: false, reason: "guest_or_authwall", url: page.url(), diag: before };
 }
 
-async function interactiveLogin(context, page) {
+async function interactiveLogin(context, page, storagePath) {
   if (!ALLOW_INTERACTIVE_LOGIN) return { ok: false, reason: "interactive_disabled" };
-  console.log("[auth] interactive login: complete username + password + 2FA.");
+
+  console.log("[auth] interactive login: navigate to LinkedIn login and complete username + password + 2FA.");
   const deadline = Date.now() + INTERACTIVE_LOGIN_TIMEOUT_MS;
+
   try { await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
   while (Date.now() < deadline) {
     await sleep(1500);
     const ok = !(await isAuthWalledOrGuest(page));
     if (ok) {
+      await saveStorageState(context, storagePath);
       console.log("[auth] interactive login success; session will persist.");
       return { ok: true, via: "interactive", url: page.url() };
     }
@@ -407,186 +437,164 @@ async function interactiveLogin(context, page) {
   return { ok: false, reason: "interactive_timeout" };
 }
 
-// =========================
-// Scraping helpers (About + Current role)
-// =========================
-async function waitProfileSettled(page) {
-  await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(()=>{});
-  await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(()=>{});
-  await page.waitForTimeout(PROFILE_AFTER_LOAD_WAIT_MS);
+// -------------------------
+// Human warm-up & scraping
+// -------------------------
+async function warmupOnFeed(page) {
+  try {
+    const alreadyOnFeed = /\/\/(m\.)?linkedin\.com\/feed\//i.test(page.url());
+    if (!alreadyOnFeed) {
+      await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 });
+    }
+    await page.waitForTimeout(FEED_AFTER_LOAD_WAIT_MS);
+    const end = Date.now() + FEED_WANDER_MS;
+    while (Date.now() < end) {
+      try { await page.mouse.wheel(0, within(160, 280)); } catch {}
+      await page.waitForTimeout(within(200, 450));
+      try { await page.mouse.move(within(100, 600), within(120, 420), { steps: within(2, 4) }); } catch {}
+    }
+  } catch {}
 }
 
-async function revealSeeMoreIfPresent(scope) {
-  const candidates = [
-    scope.getByRole("button", { name: /see more/i }),
-    scope.locator('button:has-text("See more")'),
-    scope.locator('button[aria-expanded="false"]'),
-  ];
-  for (const btn of candidates) {
-    try {
-      const h = btn.first();
-      if (await h.isVisible({ timeout: 600 }).catch(()=>false)) {
-        await h.click({ timeout: 3000 }).catch(()=>{});
+async function scrapeAboutAndCurrentRole(page) {
+  let aboutText = null;
+  let currentRoleText = null;
+
+  // Find "About" section
+  try {
+    // Scroll near "About"
+    const aboutHeader = page.locator('h2:has-text("About"), h3:has-text("About")').first();
+    if (await aboutHeader.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await aboutHeader.scrollIntoViewIfNeeded().catch(()=>{});
+      await microDelay();
+
+      // Expand "See more" if present
+      const seeMore = aboutHeader.locator('xpath=../..').locator('button:has-text("See more"), a:has-text("See more")').first();
+      if (await seeMore.isVisible({ timeout: 800 }).catch(() => false)) {
+        await seeMore.click({ timeout: 3000 }).catch(()=>{});
         await microDelay();
-        return true;
       }
-    } catch {}
-  }
-  return false;
-}
 
-async function getAboutText(page) {
-  const aboutSectionLocators = [
-    page.locator('section[id="about"]'),
-    page.locator('section:has(h2:has-text("About"))'),
-    page.locator('div:has(h2:has-text("About"))').locator('..').filter({ has: page.locator('section') }).first(),
-  ];
-  for (const sec of aboutSectionLocators) {
-    try {
-      const visible = await sec.first().isVisible({ timeout: 1200 }).catch(()=>false);
-      if (!visible) continue;
-      await sec.scrollIntoViewIfNeeded().catch(()=>{});
+      // Grab the nearest text block after header
+      const aboutBlock = aboutHeader.locator('xpath=following::*[self::div or self::section][1]').first();
+      const text = await aboutBlock.innerText({ timeout: 2000 }).catch(() => "");
+      aboutText = (text || "").trim().replace(/\n{3,}/g, "\n\n");
+    }
+  } catch {}
+
+  // Current role (top experience item)
+  try {
+    // Approach 1: top card "Experience" snippet
+    const expHeader = page.locator('h2:has-text("Experience"), h3:has-text("Experience")').first();
+    if (await expHeader.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await expHeader.scrollIntoViewIfNeeded().catch(()=>{});
       await microDelay();
-      await revealSeeMoreIfPresent(sec);
-      const textNode = [sec.locator('[class*="inline-show-more-text"]'), sec.locator('div[dir="ltr"]'), sec.locator('p')];
-      for (const t of textNode) {
-        const handle = t.first();
-        const ok = await handle.isVisible({ timeout: 600 }).catch(()=>false);
-        if (ok) {
-          const txt = await handle.innerText().catch(()=>null);
-          if (txt && txt.trim().length > 0) return txt.trim();
+
+      // Expand "Show all" OR "See more"
+      const showAll = expHeader.locator('xpath=../..').locator('button:has-text("See more"), button:has-text("Show all"), a:has-text("See more"), a:has-text("Show all")').first();
+      if (await showAll.isVisible({ timeout: 800 }).catch(() => false)) {
+        await showAll.click({ timeout: 3000 }).catch(()=>{});
+        await microDelay();
+      }
+
+      // First experience card content
+      const firstItem = expHeader.locator('xpath=following::*[self::ul or self::div][1]').locator('li, div').first();
+      if (await firstItem.isVisible({ timeout: 1500 }).catch(() => false)) {
+        // If it has a "see more" inside, expand it
+        const innerSeeMore = firstItem.locator('button:has-text("See more"), a:has-text("See more")').first();
+        if (await innerSeeMore.isVisible({ timeout: 600 }).catch(()=>false)) {
+          await innerSeeMore.click({ timeout: 2500 }).catch(()=>{});
+          await microDelay();
         }
+        const text = await firstItem.innerText({ timeout: 2000 }).catch(() => "");
+        currentRoleText = (text || "").trim().replace(/\n{3,}/g, "\n\n");
       }
-    } catch {}
-  }
-  // Mobile fallback
-  try {
-    const mHead = page.locator('h2:has-text("About")').first();
-    if (await mHead.isVisible({ timeout: 800 }).catch(()=>false)) {
-      const container = mHead.locator('..').locator('..');
-      await container.scrollIntoViewIfNeeded().catch(()=>{});
-      await microDelay();
-      await revealSeeMoreIfPresent(container);
-      const txt = await container.locator('p, div[dir="ltr"]').first().innerText().catch(()=>null);
-      if (txt && txt.trim()) return txt.trim();
     }
   } catch {}
-  return null;
-}
 
-async function getCurrentRoleText(page) {
-  const expSection = [page.locator('section[id="experience"]'), page.locator('section:has(h2:has-text("Experience"))')];
-  for (const sec of expSection) {
-    const s = sec.first();
-    try {
-      if (!(await s.isVisible({ timeout: 1500 }).catch(()=>false))) continue;
-      await s.scrollIntoViewIfNeeded().catch(()=>{});
-      await microDelay();
-      const items = [s.locator('li').first(), s.locator('[data-view-name*="experience_item"]').first()];
-      for (const it of items) {
-        try {
-          if (!(await it.isVisible({ timeout: 800 }).catch(()=>false))) continue;
-          await revealSeeMoreIfPresent(it);
-          const desc = [it.locator('div[dir="ltr"]'), it.locator('p'), it.locator('[class*="inline-show-more-text"]')];
-          for (const d of desc) {
-            const h = d.first();
-            const ok = await h.isVisible({ timeout: 600 }).catch(()=>false);
-            if (ok) {
-              const txt = await h.innerText().catch(()=>null);
-              if (txt && txt.trim().length > 0) return txt.trim();
-            }
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-  // Mobile fallback
-  try {
-    const mHead = page.locator('h2:has-text("Experience")').first();
-    if (await mHead.isVisible({ timeout: 800 }).catch(()=>false)) {
-      const container = mHead.locator('..').locator('..');
-      await container.scrollIntoViewIfNeeded().catch(()=>{});
-      await microDelay();
-      const firstCard = container.locator('li, article, div').first();
-      if (await firstCard.isVisible({ timeout: 800 }).catch(()=>false)) {
-        await revealSeeMoreIfPresent(firstCard);
-        const txt = await firstCard.locator('p, div[dir="ltr"]').first().innerText().catch(()=>null);
-        if (txt && txt.trim()) return txt.trim();
-      }
-    }
-  } catch {}
-  return null;
+  return { aboutText, currentRoleText };
 }
 
 // =========================
-// Relationship/Connect flow
+// Connect flow
 // =========================
 async function detectRelationshipStatus(page) {
-  const pendingCand = [
-    page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i }),
-    page.locator('text=/Pending invitation/i'),
+  const checks = [
+    { type: "connected", loc: page.getByRole("button", { name: /^Message$/i }) },
+    { type: "connected", loc: page.getByRole("link",   { name: /^Message$/i }) },
+    { type: "pending",   loc: page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i }) },
+    { type: "pending",   loc: page.locator('text=/Pending invitation/i') },
+    { type: "can_connect", loc: page.getByRole("button", { name: /^Connect$/i }) },
+    { type: "can_connect", loc: page.locator('button:has-text("Connect"), a:has-text("Connect")') },
   ];
-  for (const p of pendingCand) {
-    if (await p.first().isVisible({ timeout: 800 }).catch(() => false)) {
-      return { status: "pending", reason: "Pending/Requested visible" };
-    }
-  }
-  const connectPrimary = [
-    page.getByRole("button", { name: /^Connect$/i }),
-    page.getByRole("link",   { name: /^Connect$/i }),
-    page.locator('button:has-text("Connect"), a:has-text("Connect")'),
-  ];
-  for (const c of connectPrimary) {
-    if (await c.first().isVisible({ timeout: 800 }).catch(() => false)) {
-      return { status: "not_connected", reason: "Connect visible (primary)" };
-    }
-  }
-  const moreBtns = [
-    page.getByRole("button", { name: /^More$/i }),
-    page.getByRole("button", { name: /More actions/i }),
-    page.locator('button[aria-label="More actions"]'),
-  ];
-  for (const mb of moreBtns) {
-    if (await mb.first().isVisible({ timeout: 800 }).catch(() => false)) {
-      await mb.first().click({ timeout: 3000 }).catch(() => {});
-      await microDelay();
-      const menuConnect = [
-        page.getByRole("menuitem", { name: /^Connect$/i }),
-        page.locator('div[role="menuitem"]:has-text("Connect")'),
-        page.locator('span:has-text("Connect")'),
-      ];
-      for (const mi of menuConnect) {
-        if (await mi.first().isVisible({ timeout: 800 }).catch(() => false)) {
-          return { status: "not_connected", reason: "Connect under More" };
-        }
+  for (const c of checks) {
+    try {
+      const visible = await c.loc.first().isVisible({ timeout: 900 }).catch(() => false);
+      if (visible) {
+        if (c.type === "connected") return { status: "connected", reason: "Message CTA visible" };
+        if (c.type === "pending")   return { status: "pending", reason: "Pending/Requested visible" };
+        if (c.type === "can_connect") return { status: "not_connected" };
       }
-    }
+    } catch {}
   }
-  const firstDegree = [
-    page.locator('span:has-text("1st")'),
-    page.locator('span:has-text("1st degree")'),
-    page.locator('span:has-text("Connected")'),
-  ];
-  for (const fd of firstDegree) {
-    if (await fd.first().isVisible({ timeout: 600 }).catch(() => false)) {
-      return { status: "connected", reason: "1st/Connected badge" };
-    }
-  }
-  const msgBtns = [
-    page.getByRole("button", { name: /^Message$/i }),
-    page.getByRole("link",   { name: /^Message$/i }),
-    page.locator('button[aria-label="Message"]'),
-  ];
-  for (const m of msgBtns) {
-    if (await m.first().isVisible({ timeout: 800 }).catch(() => false)) {
-      return { status: "not_connected", reason: "Message CTA only (InMail/Open Profile)" };
-    }
-  }
-  return { status: "not_connected", reason: "No Connect/Message/Pending detected" };
+  return { status: "not_connected", reason: "Connect may be under More menu or mobile UI" };
 }
 
 async function openConnectDialog(page) {
   await microDelay();
+
+  // Prefer the top card / sticky header
+  const topAreas = [
+    page.locator('[data-view-name*="profile-top-card"]').first(),
+    page.locator('section:has(h1)').first(),
+    page.locator('header').first(),
+  ];
+
+  for (const area of topAreas) {
+    try {
+      if (!(await area.isVisible({ timeout: 800 }).catch(() => false))) continue;
+      await area.scrollIntoViewIfNeeded().catch(()=>{});
+      await microDelay();
+
+      const direct = area.locator('button:has-text("Connect"), a:has-text("Connect")').first();
+      if (await direct.isVisible({ timeout: 600 }).catch(() => false)) {
+        await direct.click({ timeout: 4000 });
+        await microDelay();
+        const dialogReady = await Promise.race([
+          page.getByRole("dialog").waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+          page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+          page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+        ]);
+        if (dialogReady) return { opened: true, via: "topcard_primary" };
+      }
+
+      const more = area.locator('button[aria-label="More actions"], button:has-text("More")').first();
+      if (await more.isVisible({ timeout: 800 }).catch(() => false)) {
+        await more.click({ timeout: 4000 }).catch(()=>{});
+        await microDelay();
+        const mi = [
+          page.getByRole("menuitem", { name: /^Connect$/i }),
+          page.locator('div[role="menuitem"]:has-text("Connect")'),
+          page.locator('span:has-text("Connect")')
+        ];
+        for (const c of mi) {
+          const h = c.first();
+          if (await h.isVisible({ timeout: 800 }).catch(()=>false)) {
+            await h.click({ timeout: 4000 });
+            await microDelay();
+            const dialogReady = await Promise.race([
+              page.getByRole("dialog").waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+              page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+              page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3000 }).then(() => true).catch(() => false),
+            ]);
+            if (dialogReady) return { opened: true, via: "topcard_more" };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Fallback: global search
   const directButtons = [
     page.getByRole("button", { name: /^Connect$/i }),
     page.locator('button:has-text("Connect")'),
@@ -606,6 +614,7 @@ async function openConnectDialog(page) {
       }
     } catch {}
   }
+
   const moreCandidates = [
     page.getByRole("button", { name: /^More$/i }),
     page.getByRole("button", { name: /More actions/i }),
@@ -636,6 +645,7 @@ async function openConnectDialog(page) {
       }
     } catch {}
   }
+
   // Mobile fallback
   try {
     const mobileConnect = page.locator('button:has-text("Connect"), a:has-text("Connect")');
@@ -809,6 +819,7 @@ async function clickSendInComposer(page) {
       }
     } catch {}
   }
+  // Fallback: send via Enter/Ctrl+Enter
   try {
     const editor = page.locator('.msg-form__contenteditable[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea').first();
     if (await editor.isVisible({ timeout: 600 }).catch(() => false)) {
@@ -852,51 +863,41 @@ async function sendMessageFlow(page, messageText) {
 }
 
 // =========================
-// AUTH_CHECK (for 2FA viewer + persist)
+// Job handlers
 // =========================
 async function handleAuthCheck(job) {
-  const userId = job?.payload?.userId || "default";
-  const cookieBundle = job?.payload?.cookieBundle || {};
-  if (SOFT_MODE) return { mode: "soft", message: "Auth check soft OK", at: new Date().toISOString() };
+  const { payload } = job || {};
+  const userId = payload?.userId || payload?.email || null;
+  const storagePath = statePathForUser(userId);
 
-  let browser, context, page, videoHandle, saveState;
+  await throttle.reserve("linkedin.com", "AUTH_CHECK");
+
+  let browser, context, page, videoHandle;
   try {
-    ({ browser, context, page, saveState } = await createBrowserContext(cookieBundle, HEADLESS, userId));
+    ({ browser, context, page } = await createBrowserContext(null, HEADLESS, storagePath));
     videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    let auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
-    if (!auth.ok && ALLOW_INTERACTIVE_LOGIN) {
-      await interactiveLogin(context, page);
-      auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
-    }
+    let auth = await ensureAuthenticated(context, page, storagePath);
     if (!auth.ok) {
-      await context.tracing.stop({ path: "/tmp/trace-auth-failed.zip" }).catch(()=>{});
-      await browser.close().catch(()=>{});
-      if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
-      return { mode: "real", message: "Not authenticated yet", at: new Date().toISOString() };
+      const inter = await interactiveLogin(context, page, storagePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, storagePath);
     }
+    const ok = !!auth.ok;
 
-    // Go to feed once, wander, save state
-    if (!/linkedin\.com\/feed\/?/.test(page.url())) {
-      try { await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 }); } catch {}
-    }
-    await wanderOnFeed(page);
-    await saveState();
-
-    await context.tracing.stop({ path: "/tmp/trace-auth.zip" }).catch(()=>{});
-    await browser.close().catch(()=>{});
+    try { await context.tracing.stop({ path: ok ? "/tmp/trace-auth.zip" : "/tmp/trace-auth-failed.zip" }); } catch {}
+    await browser.close().catch(() => {});
     if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
-    return { mode: "real", message: "Authenticated and storageState saved.", at: new Date().toISOString() };
+
+    return ok
+      ? { message: "Authenticated and storageState saved.", via: auth.via, at: new Date().toISOString() }
+      : { message: "Auth failed; complete interactive login.", details: auth, at: new Date().toISOString() };
   } catch (e) {
     try { await browser?.close(); } catch {}
-    throw e;
+    throw new Error(`AUTH_CHECK failed: ${e.message}`);
   }
 }
 
-// =========================
-// SEND_CONNECTION (feed once → profile clean navigate → scrape → connect → 2s hold)
-// =========================
 async function handleSendConnection(job) {
   const { payload } = job || {};
   if (!payload) throw new Error("Job has no payload");
@@ -907,57 +908,50 @@ async function handleSendConnection(job) {
   }
   const note = payload.note || null;
   const cookieBundle = payload.cookieBundle || {};
-  const userId = payload.userId || payload.email || "default";
+  const userId = payload.userId || null;
+  const storagePath = statePathForUser(userId);
 
   if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
 
   if (SOFT_MODE) {
     await throttle.reserve("linkedin.com", "SOFT send_connection"); await microDelay(); throttle.success("linkedin.com");
-    return { mode: "soft", profileUrl: targetUrl, noteUsed: note, message: "Soft mode success (no browser).", at: new Date().toISOString() };
+    return {
+      mode: "soft",
+      profileUrl: targetUrl,
+      noteUsed: note,
+      message: "Soft mode success (no browser).",
+      scraped: { aboutText: null, currentRoleText: null },
+      at: new Date().toISOString()
+    };
   }
 
   await throttle.reserve("linkedin.com", "SEND_CONNECTION");
 
-  let browser, context, page, videoHandle, saveState;
+  let browser, context, page, videoHandle;
   try {
-    ({ browser, context, page, saveState } = await createBrowserContext(cookieBundle, HEADLESS, userId));
+    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS, storagePath));
     videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    // Auth (avoid multiple feed navs)
-    let auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
-    if (!auth.ok && ALLOW_INTERACTIVE_LOGIN) {
-      await interactiveLogin(context, page);
-      auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
+    // AUTH PREFLIGHT -> interactive public login if needed
+    let auth = await ensureAuthenticated(context, page, storagePath);
+    if (!auth.ok) {
+      const inter = await interactiveLogin(context, page, storagePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, storagePath);
     }
     if (!auth.ok) {
       const result = {
-        mode: "real", profileUrl: targetUrl, usedUrl: "preflight", finalUrl: auth.url,
-        httpStatus: null, pageTitle: await page.title().catch(() => null),
-        relationshipStatus: "not_connected", actionTaken: "unavailable",
+        mode: "real",
+        profileUrl: targetUrl,
+        usedUrl: "preflight",
+        finalUrl: auth.url,
+        httpStatus: null,
+        pageTitle: await page.title().catch(() => null),
+        relationshipStatus: "not_connected",
+        actionTaken: "unavailable",
         details: "Not authenticated (guest/authwall). Complete 2FA or refresh cookies.",
-        authDiag: auth.diag, at: new Date().toISOString(),
-      };
-      try { await context.tracing.stop({ path: "/tmp/trace-failed.zip" }); } catch {}
-      await browser.close().catch(() => {});
-      if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
-      throttle.failure("linkedin.com");
-      return result;
-    }
-
-    // Human: go to FEED once, wander, then profile
-    if (!/linkedin\.com\/feed\/?/.test(page.url())) {
-      try { await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 }); } catch {}
-    }
-    await wanderOnFeed(page);
-
-    // Profile nav (no decorations)
-    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: MAX_NAV_RETRIES });
-    if (nav.error === "not_found" || (nav.status && [404,410].includes(nav.status))) {
-      const result = {
-        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
-        httpStatus: nav.status || 404, pageTitle: await page.title().catch(() => null),
-        relationshipStatus: "unknown", actionTaken: "unavailable", details: "Profile page not found.",
+        authDiag: auth.diag,
+        scraped: { aboutText: null, currentRoleText: null },
         at: new Date().toISOString(),
       };
       try { await context.tracing.stop({ path: "/tmp/trace-failed.zip" }); } catch {}
@@ -966,11 +960,18 @@ async function handleSendConnection(job) {
       throttle.failure("linkedin.com");
       return result;
     }
+
+    // Human warm-up on feed
+    await warmupOnFeed(page);
+
+    // Navigate to public profile only
+    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: 3 });
     if (!nav.authed) {
       const result = {
         mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
         httpStatus: nav.status, pageTitle: await page.title().catch(() => null),
         relationshipStatus: "not_connected", actionTaken: "unavailable", details: "Authwall/999 on profile nav.",
+        scraped: { aboutText: null, currentRoleText: null },
         at: new Date().toISOString(),
       };
       try { await context.tracing.stop({ path: "/tmp/trace-failed.zip" }); } catch {}
@@ -980,16 +981,18 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // Scrape → Connect → hold → save state
-    await waitProfileSettled(page);
-    const aboutText = await getAboutText(page);
-    const currentRoleText = await getCurrentRoleText(page);
-
+    // Let profile load & breathe
+    await page.waitForTimeout(PROFILE_AFTER_LOAD_WAIT_MS);
     await humanizePage(page);
+
+    // Scrape requested bits
+    const scraped = await scrapeAboutAndCurrentRole(page);
+
+    // Send connection
     const connectOutcome = await sendConnectionRequest(page, note);
 
-    await sleep(POST_CONNECT_HOLD_MS);
-    await saveState();
+    // Hold after sending (or attempt) before finishing
+    await page.waitForTimeout(POST_CONNECT_HOLD_MS);
 
     const result = {
       mode: "real",
@@ -1002,8 +1005,7 @@ async function handleSendConnection(job) {
       relationshipStatus: connectOutcome.relationshipStatus,
       actionTaken: connectOutcome.actionTaken,
       details: connectOutcome.details,
-      aboutText: aboutText || null,
-      currentRoleText: currentRoleText || null,
+      scraped,
       at: new Date().toISOString(),
     };
 
@@ -1030,9 +1032,6 @@ async function handleSendConnection(job) {
   }
 }
 
-// =========================
-// SEND_MESSAGE (kept consistent)
-// =========================
 async function handleSendMessage(job) {
   const { payload } = job || {};
   if (!payload) throw new Error("Job has no payload");
@@ -1043,7 +1042,9 @@ async function handleSendMessage(job) {
   }
   const messageText = payload.message;
   const cookieBundle = payload.cookieBundle || {};
-  const userId = payload.userId || payload.email || "default";
+  const userId = payload.userId || null;
+  const storagePath = statePathForUser(userId);
+
   if (!messageText) throw new Error("payload.message required");
   if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
 
@@ -1054,43 +1055,30 @@ async function handleSendMessage(job) {
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
 
-  let browser, context, page, videoHandle, saveState;
+  let browser, context, page, videoHandle;
   try {
-    ({ browser, context, page, saveState } = await createBrowserContext(cookieBundle, HEADLESS, userId));
+    ({ browser, context, page } = await createBrowserContext(cookieBundle, HEADLESS, storagePath));
     videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    let auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
-    if (!auth.ok && ALLOW_INTERACTIVE_LOGIN) {
-      await interactiveLogin(context, page);
-      auth = await ensureAuthenticated(context, page, { avoidFeedNav: true });
+    // AUTH PREFLIGHT -> interactive public login if needed
+    let auth = await ensureAuthenticated(context, page, storagePath);
+    if (!auth.ok) {
+      const inter = await interactiveLogin(context, page, storagePath);
+      if (inter.ok) auth = await ensureAuthenticated(context, page, storagePath);
     }
     if (!auth.ok) {
       const result = {
-        mode: "real", profileUrl: targetUrl, usedUrl: "preflight", finalUrl: auth.url,
-        httpStatus: null, pageTitle: await page.title().catch(() => null),
-        relationshipStatus: "unknown", actionTaken: "unavailable",
+        mode: "real",
+        profileUrl: targetUrl,
+        usedUrl: "preflight",
+        finalUrl: auth.url,
+        httpStatus: null,
+        pageTitle: await page.title().catch(() => null),
+        relationshipStatus: "unknown",
+        actionTaken: "unavailable",
         details: "Not authenticated (guest/authwall). Complete 2FA or refresh cookies.",
-        authDiag: auth.diag, at: new Date().toISOString(),
-      };
-      try { await context.tracing.stop({ path: "/tmp/trace-failed.zip" }); } catch {}
-      await browser.close().catch(() => {});
-      if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
-      throttle.failure("linkedin.com");
-      return result;
-    }
-
-    if (!/linkedin\.com\/feed\/?/.test(page.url())) {
-      try { await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 25000 }); } catch {}
-    }
-    await wanderOnFeed(page);
-
-    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: MAX_NAV_RETRIES });
-    if (nav.error === "not_found" || (nav.status && [404,410].includes(nav.status))) {
-      const result = {
-        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
-        httpStatus: nav.status || 404, pageTitle: await page.title().catch(() => null),
-        relationshipStatus: "unknown", actionTaken: "unavailable", details: "Profile page not found.",
+        authDiag: auth.diag,
         at: new Date().toISOString(),
       };
       try { await context.tracing.stop({ path: "/tmp/trace-failed.zip" }); } catch {}
@@ -1099,6 +1087,9 @@ async function handleSendMessage(job) {
       throttle.failure("linkedin.com");
       return result;
     }
+
+    // Navigate to public profile only
+    const nav = await navigateLinkedInWithRetries(page, targetUrl, { attempts: 3 });
     if (!nav.authed) {
       const result = {
         mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || page.url(),
@@ -1113,10 +1104,9 @@ async function handleSendMessage(job) {
       return result;
     }
 
-    await waitProfileSettled(page);
     await humanizePage(page);
     const outcome = await sendMessageFlow(page, messageText);
-    await saveState();
+    await microDelay();
 
     const result = {
       mode: "real",
@@ -1172,8 +1162,9 @@ async function processOne() {
 
   try {
     let result = null;
+
     switch (job.type) {
-      case "AUTH_CHECK":      result = await handleAuthCheck(job); break;
+      case "AUTH_CHECK":     result = await handleAuthCheck(job); break;
       case "SEND_CONNECTION": result = await handleSendConnection(job); break;
       case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
       default: result = { note: `Unhandled job type: ${job.type}` }; break;

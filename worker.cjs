@@ -1,14 +1,15 @@
-// worker.cjs — LinqBridge Worker (robust + calm nav + hard 429/404 guard + proxy-ready)
+// worker.cjs — LinqBridge Worker (robust nav, 429/404/captcha guard, proxy-ready, with PROXY_PROBE)
 //
-// Guarantees (per your spec):
-// 1) FEED: after login, wait ~10s, then scroll ~5s. No extra refreshes.
-// 2) PROFILE: navigate once (mobile fallback only if strictly needed), then wait ~10s. No refresh loops.
-// 3) Scraping patiently expands “See more” where present.
-// 4) Connect button is tried directly and under “More”.
-// 5) Upfront guard rejects /in/ACo… or /in/ACw… URN slugs (prevents 404 loops).
-// 6) Post-nav 429/404/verification detection bails and triggers cooldown.
-// 7) Conservative throttling defaults to avoid 429s (override via env).
-// 8) Optional HTTP proxy support + WebRTC leak suppression (set PROXY_* envs).
+// Guarantees:
+// 1) FEED: after auth, wait ~10s then scroll ~5s. No extra refreshes.
+// 2) PROFILE: single navigation (+ optional one mobile fallback), then wait ~10s. No loops.
+// 3) Patient scraping of About + current role (expands "See more").
+// 4) Connect via primary CTA or under "More".
+// 5) Rejects /in/ACo… or /in/ACw… internal URN-like slugs (prevents 404 spins).
+// 6) Detects 429/404/captcha screens and bails with cooldown.
+// 7) Conservative throttling to avoid 429 by default.
+// 8) Proxy support via env: PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD.
+// 9) PROXY_PROBE job type to verify egress IPs without touching LinkedIn.
 
 const path = require("path");
 const fs = require("fs");
@@ -41,13 +42,18 @@ if (process.env.ENABLE_HEALTH === "true") {
 const API_BASE = process.env.API_BASE || "https://YOUR-BACKEND.example.com";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
-// Real browser by default (set SOFT_MODE=true to dry-run)
+// Proxy (optional)
+const PROXY_SERVER = process.env.PROXY_SERVER || "";           // e.g. "http://host:port" or "socks5://host:port"
+const PROXY_USERNAME = process.env.PROXY_USERNAME || "";
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
+
+// Run real browser actions by default (override with SOFT_MODE=true to dry-run)
 const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "false");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
-// Human pacing — conservative to avoid 429s
+// Human pacing — conservative defaults to avoid 429
 const MAX_ACTIONS_PER_HOUR = parseInt(process.env.MAX_ACTIONS_PER_HOUR || "18", 10);
 const MIN_GAP_MS = parseInt(process.env.MIN_GAP_MS || "60000", 10);
 const COOLDOWN_AFTER_SENT_MS = parseInt(process.env.COOLDOWN_AFTER_SENT_MS || "90000", 10);
@@ -58,8 +64,8 @@ const MICRO_DELAY_MIN_MS = parseInt(process.env.MICRO_DELAY_MIN_MS || "400", 10)
 const MICRO_DELAY_MAX_MS = parseInt(process.env.MICRO_DELAY_MAX_MS || "1200", 10);
 
 // Per your spec
-const FEED_INITIAL_WAIT_MS = parseInt(process.env.FEED_INITIAL_WAIT_MS || "10000", 10);   // ~10s
-const FEED_SCROLL_MS = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);               // ~5s
+const FEED_INITIAL_WAIT_MS = parseInt(process.env.FEED_INITIAL_WAIT_MS || "10000", 10);  // ~10s
+const FEED_SCROLL_MS = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);              // ~5s
 const PROFILE_INITIAL_WAIT_MS = parseInt(process.env.PROFILE_INITIAL_WAIT_MS || "10000", 10); // ~10s
 
 // Fallbacks
@@ -71,11 +77,6 @@ const STATE_DIR = process.env.STATE_DIR || "/app/state";
 const FORCE_RELOGIN = (/^(true|1|yes)$/i).test(process.env.FORCE_RELOGIN || "false");
 const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "true");
 const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10); // 5 min
-
-// Proxy (optional)
-const PROXY_SERVER = process.env.PROXY_SERVER || null;           // e.g. "http://host:port"
-const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
-const PROXY_PASSWORD = process.env.PROXY_PASSWORD || null;
 
 // Playwright (lazy import)
 let chromium = null;
@@ -169,14 +170,14 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-/* Playwright helpers */
+// Playwright helpers
 // =========================
 async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   if (!chromium) ({ chromium } = require("playwright"));
 
   try { await fs.promises.mkdir(path.dirname(userStatePath || DEFAULT_STATE_PATH), { recursive: true }); } catch {}
 
-  const launchOpts = {
+  const launchOptions = {
     headless: !!headless,
     slowMo: SLOWMO_MS,
     args: [
@@ -188,15 +189,16 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
       "--webrtc-stun-probe-trial=disabled",
     ],
   };
+
   if (PROXY_SERVER) {
-    launchOpts.proxy = {
+    launchOptions.proxy = {
       server: PROXY_SERVER,
       username: PROXY_USERNAME || undefined,
       password: PROXY_PASSWORD || undefined,
     };
   }
 
-  const browser = await chromium.launch(launchOpts);
+  const browser = await chromium.launch(launchOptions);
 
   const vw = 1280 + Math.floor(Math.random() * 192);
   const vh = 720 + Math.floor(Math.random() * 160);
@@ -244,8 +246,8 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(35000);            // generous
-  page.setDefaultNavigationTimeout(45000);  // generous
+  page.setDefaultTimeout(35000);
+  page.setDefaultNavigationTimeout(45000);
 
   // Optional cookie bundle (augments storageState)
   if (cookieBundle && (cookieBundle.li_at || cookieBundle.jsessionid || cookieBundle.bcookie)) {
@@ -306,7 +308,7 @@ async function isAuthWalledOrGuest(page) {
 async function ensureAuthenticated(context, page, userStatePath) {
   const before = await cookieDiag(context);
 
-  // Try desktop feed once
+  // Desktop feed
   try {
     const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     const s = r ? r.status() : null;
@@ -316,7 +318,7 @@ async function ensureAuthenticated(context, page, userStatePath) {
     }
   } catch {}
 
-  // Mobile feed fallback (single fallback only)
+  // Mobile feed (single fallback)
   try {
     const r = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     const s = r ? r.status() : null;
@@ -326,7 +328,7 @@ async function ensureAuthenticated(context, page, userStatePath) {
     }
   } catch {}
 
-  // Optional interactive login once
+  // Interactive login (once)
   if (!ALLOW_INTERACTIVE_LOGIN) {
     return { ok: false, reason: "guest_or_authwall", url: page.url(), diag: before };
   }
@@ -370,7 +372,7 @@ async function navigateProfileClean(page, rawUrl) {
     attempts.push(rawUrl.replace("www.linkedin.com", "m.linkedin.com").replace("linkedin.com/in/", "m.linkedin.com/in/"));
   }
 
-  // First attempt
+  // Try desktop (as-is)
   try {
     const resp = await page.goto(attempts[0], { waitUntil: "domcontentloaded", timeout: 30000 });
     const status = resp ? resp.status() : null;
@@ -383,10 +385,10 @@ async function navigateProfileClean(page, rawUrl) {
       return { authed: true, status, usedUrl: attempts[0], finalUrl };
     }
   } catch (e) {
-    // fall through
+    // fall through to fallback if allowed
   }
 
-  // Optional single fallback
+  // Try mobile fallback (once)
   if (attempts[1]) {
     try {
       const resp = await page.goto(attempts[1], { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -405,7 +407,6 @@ async function navigateProfileClean(page, rawUrl) {
     }
   }
 
-  // If both fail
   return { authed: false, status: null, usedUrl: attempts[0], finalUrl: page.url(), error: "authwall_or_unknown" };
 }
 
@@ -418,14 +419,14 @@ async function humanScroll(page, durationMs = 2000) {
   }
 }
 
-// FEED warmup exactly as requested (no refresh)
+// FEED warmup with your exact behavior
 async function feedWarmup(page) {
   try {
     if (!/linkedin\.com\/feed\/?$/i.test(page.url())) {
       await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     }
-    await sleep(FEED_INITIAL_WAIT_MS);   // wait ~10s
-    await humanScroll(page, FEED_SCROLL_MS); // scroll ~5s
+    await sleep(FEED_INITIAL_WAIT_MS);
+    await humanScroll(page, FEED_SCROLL_MS);
   } catch {}
 }
 
@@ -456,7 +457,6 @@ async function safeInnerText(loc) {
 
 // Scrape About + current role (patient)
 async function scrapeAboutAndCurrentRole(page) {
-  // Let profile settle (another ~10s)
   await sleep(PROFILE_INITIAL_WAIT_MS);
 
   // ABOUT
@@ -476,7 +476,6 @@ async function scrapeAboutAndCurrentRole(page) {
     (await safeInnerText(firstItem.locator('.inline-show-more-text, .pvs-list__outer-container, [data-test="experience-item"]').first())) ||
     (await safeInnerText(firstItem));
 
-  // Trim to sane sizes
   const clip = (s, n=4000) => (s && s.length > n ? s.slice(0, n) : s) || "";
   return {
     about: clip(aboutText),
@@ -487,19 +486,19 @@ async function scrapeAboutAndCurrentRole(page) {
 // Relationship & Connect flow
 async function detectRelationshipStatus(page) {
   const checks = [
-    { type: "connected",    loc: page.getByRole("button", { name: /^Message$/i }) },
-    { type: "connected",    loc: page.getByRole("link",   { name: /^Message$/i }) },
-    { type: "pending",      loc: page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i }) },
-    { type: "pending",      loc: page.locator('text=/Pending invitation/i') },
-    { type: "can_connect",  loc: page.getByRole("button", { name: /^Connect$/i }) },
-    { type: "can_connect",  loc: page.locator('button:has-text("Connect"), a:has-text("Connect")') },
+    { type: "connected", loc: page.getByRole("button", { name: /^Message$/i }) },
+    { type: "connected", loc: page.getByRole("link",   { name: /^Message$/i }) },
+    { type: "pending",   loc: page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i }) },
+    { type: "pending",   loc: page.locator('text=/Pending invitation/i') },
+    { type: "can_connect", loc: page.getByRole("button", { name: /^Connect$/i }) },
+    { type: "can_connect", loc: page.locator('button:has-text("Connect"), a:has-text("Connect")') },
   ];
   for (const c of checks) {
     try {
       const visible = await c.loc.first().isVisible({ timeout: 1200 }).catch(() => false);
       if (visible) {
-        if (c.type === "connected")   return { status: "connected",     reason: "Message CTA visible" };
-        if (c.type === "pending")     return { status: "pending",       reason: "Pending/Requested visible" };
+        if (c.type === "connected") return { status: "connected", reason: "Message CTA visible" };
+        if (c.type === "pending")   return { status: "pending", reason: "Pending/Requested visible" };
         if (c.type === "can_connect") return { status: "not_connected" };
       }
     } catch {}
@@ -558,7 +557,7 @@ async function openConnectDialog(page) {
       }
     } catch {}
   }
-  // Mobile fallback
+  // Mobile fallback UI
   try {
     const mobileConnect = page.locator('button:has-text("Connect"), a:has-text("Connect")');
     if (await mobileConnect.first().isVisible({ timeout: 1200 }).catch(() => false)) {
@@ -663,7 +662,7 @@ async function sendConnectionRequest(page, note) {
 }
 
 // =========================
-// Message flow (kept for completeness)
+// Message flow
 // =========================
 async function openMessageDialog(page) {
   const buttons = [
@@ -772,16 +771,72 @@ async function sendMessageFlow(page, messageText) {
 }
 
 // =========================
-// Job handlers
+// PROXY / egress IP probe (no LinkedIn calls)
+// =========================
+async function handleProxyProbe(job) {
+  const userId = job?.payload?.userId || "default";
+  const userStatePath = statePathForUser(userId);
+
+  let browser, context, page, videoHandle;
+  try {
+    ({ browser, context, page } = await createBrowserContext({
+      headless: HEADLESS,
+      cookieBundle: null,
+      userStatePath,
+    }));
+    videoHandle = page.video?.();
+    try { await context.tracing.start({ screenshots: false, snapshots: false }); } catch {}
+
+    const out = {};
+    const urls = [
+      "https://ipv4.icanhazip.com",
+      "https://www.cloudflare.com/cdn-cgi/trace",
+    ];
+
+    for (const u of urls) {
+      try {
+        const resp = await page.goto(u, { waitUntil: "domcontentloaded", timeout: 15000 });
+        const status = resp ? resp.status() : null;
+        const text = (await page.locator("body").innerText().catch(() => "")) || "";
+        out[u] = { status, text: text.trim().slice(0, 500) };
+      } catch (e) {
+        out[u] = { error: e?.message || String(e) };
+      }
+    }
+
+    const ip1 = (out["https://ipv4.icanhazip.com"]?.text || "").split("\n")[0]?.trim() || null;
+    const traceText = out["https://www.cloudflare.com/cdn-cgi/trace"]?.text || "";
+    const m = traceText.match(/ip=([^\n]+)/);
+    const ip2 = m ? m[1].trim() : null;
+
+    try { await context.tracing.stop({ path: "/tmp/trace-probe.zip" }); } catch {}
+    await browser.close().catch(() => {});
+
+    return {
+      ok: true,
+      ip_icanhazip: ip1,
+      ip_cloudflare: ip2,
+      raw: out,
+      at: new Date().toISOString(),
+    };
+  } catch (e) {
+    try { await browser?.close(); } catch {}
+    throw new Error(`PROXY_PROBE failed: ${e.message}`);
+  }
+}
+
+// =========================
+ // Job handlers
 // =========================
 async function handleAuthCheck(job) {
   const { payload } = job || {};
   const userId = payload?.userId || "default";
   const userStatePath = statePathForUser(userId);
 
-  let browser, context, page;
+  let browser, context, page, videoHandle;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle: null, userStatePath }));
+    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     const auth = await ensureAuthenticated(context, page, userStatePath);
@@ -801,6 +856,7 @@ async function handleAuthCheck(job) {
 
     try { await context.tracing.stop({ path: "/tmp/trace-auth.zip" }); } catch {}
     await browser.close().catch(() => {});
+    if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
     return result;
   } catch (e) {
     try { await context?.tracing?.stop({ path: "/tmp/trace-auth-failed.zip" }).catch(()=>{}); } catch {}
@@ -844,12 +900,13 @@ async function handleSendConnection(job) {
 
   await throttle.reserve("linkedin.com", "SEND_CONNECTION");
 
-  let browser, context, page;
+  let browser, context, page, videoHandle;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
+    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
-    // AUTH + feed warmup (single feed view only)
+    // AUTH + feed warmup
     const auth = await ensureAuthenticated(context, page, userStatePath);
     if (!auth.ok) {
       const result = {
@@ -865,7 +922,7 @@ async function handleSendConnection(job) {
     }
     await feedWarmup(page); // wait 10s + scroll 5s (no refresh)
 
-    // PROFILE nav (single attempt + optional single fallback)
+    // PROFILE nav
     const nav = await navigateProfileClean(page, targetUrl);
     if (!nav.authed) {
       const result = {
@@ -879,7 +936,7 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // Wait calmly on profile per your spec, then bail if we see hard screens
+    // Wait calmly on profile
     await sleep(PROFILE_INITIAL_WAIT_MS);
     const hard = await detectHardScreen(page);
     if (hard === "404" || hard === "429" || hard === "captcha") {
@@ -897,14 +954,13 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // SCRAPE sections (patient, expands See more)
+    // SCRAPE sections
     const { about, currentRole } = await scrapeAboutAndCurrentRole(page);
 
     // CONNECT
     await microDelay();
     const connectOutcome = await sendConnectionRequest(page, note);
 
-    // linger 2s
     await sleep(2000);
 
     const result = {
@@ -983,9 +1039,10 @@ async function handleSendMessage(job) {
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
 
-  let browser, context, page;
+  let browser, context, page, videoHandle;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
+    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     const auth = await ensureAuthenticated(context, page, userStatePath);
@@ -1037,7 +1094,6 @@ async function handleSendMessage(job) {
     const outcome = await sendMessageFlow(page, messageText);
     await microDelay();
 
-    // linger slightly
     await sleep(1500);
 
     const result = {
@@ -1078,7 +1134,7 @@ async function handleSendMessage(job) {
 async function processOne() {
   let next;
   try {
-    next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE"] });
+    next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE", "PROXY_PROBE"] });
   } catch (e) {
     logFetchError("jobs/next", e);
     return;
@@ -1093,6 +1149,7 @@ async function processOne() {
       case "AUTH_CHECK":      result = await handleAuthCheck(job); break;
       case "SEND_CONNECTION": result = await handleSendConnection(job); break;
       case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
+      case "PROXY_PROBE":     result = await handleProxyProbe(job); break;
       default: result = { note: `Unhandled job type: ${job.type}` }; break;
     }
 
@@ -1113,7 +1170,7 @@ async function processOne() {
 }
 
 async function mainLoop() {
-  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
+  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE} Proxy: ${PROXY_SERVER ? "ON" : "OFF"}`);
   if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
 
   try {

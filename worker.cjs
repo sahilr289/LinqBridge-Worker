@@ -1,14 +1,14 @@
-// worker.cjs — LinqBridge Worker (calm nav, proxy-ready, 429/404/captcha guard, robust throttling)
+// worker.cjs — LinqBridge Worker (robust + calm nav + hard 429/404 guard + proxy-ready)
 //
-// Guarantees:
-// 1) FEED: after auth, wait ~10s then scroll ~5s. No extra feed refreshes.
-// 2) PROFILE: navigate once (mobile fallback only if allowed), then wait ~10s. No refresh loops.
-// 3) Patient scrape (expands “See more” for About + current role).
-// 4) Connect via primary CTA, then “More” menu fallback.
-// 5) Upfront guard against /in/ACo… /in/ACw… URN-like slugs.
-// 6) Detect 429/404/captcha screens and bail with long cooldown.
-// 7) Conservative throttling to avoid 429s.
-// 8) Proxy support at launch (PROXY_SERVER/USERNAME/PASSWORD) + WebRTC leak hardening.
+// Guarantees (per your spec):
+// 1) FEED: after login, wait ~10s, then scroll ~5s. No extra refreshes.
+// 2) PROFILE: navigate once (mobile fallback only if strictly needed), then wait ~10s. No refresh loops.
+// 3) Scraping patiently expands “See more” where present.
+// 4) Connect button is tried directly and under “More”.
+// 5) Upfront guard rejects /in/ACo… or /in/ACw… URN slugs (prevents 404 loops).
+// 6) Post-nav 429/404/verification detection bails and triggers cooldown.
+// 7) Conservative throttling defaults to avoid 429s (override via env).
+// 8) Optional HTTP proxy support + WebRTC leak suppression (set PROXY_* envs).
 
 const path = require("path");
 const fs = require("fs");
@@ -41,18 +41,13 @@ if (process.env.ENABLE_HEALTH === "true") {
 const API_BASE = process.env.API_BASE || "https://YOUR-BACKEND.example.com";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
-// Browser mode
+// Real browser by default (set SOFT_MODE=true to dry-run)
 const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "false");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
-// Proxy (optional but recommended for production)
-const PROXY_SERVER   = process.env.PROXY_SERVER || "";   // e.g. "http://geo.iproyal.com:12321"
-const PROXY_USERNAME = process.env.PROXY_USERNAME || ""; // e.g. "user_country-in_session-abc"
-const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
-
-// Human pacing — conservative defaults to avoid 429
+// Human pacing — conservative to avoid 429s
 const MAX_ACTIONS_PER_HOUR = parseInt(process.env.MAX_ACTIONS_PER_HOUR || "18", 10);
 const MIN_GAP_MS = parseInt(process.env.MIN_GAP_MS || "60000", 10);
 const COOLDOWN_AFTER_SENT_MS = parseInt(process.env.COOLDOWN_AFTER_SENT_MS || "90000", 10);
@@ -62,9 +57,9 @@ const COOLDOWN_AFTER_FAIL_MS = parseInt(process.env.COOLDOWN_AFTER_FAIL_MS || "6
 const MICRO_DELAY_MIN_MS = parseInt(process.env.MICRO_DELAY_MIN_MS || "400", 10);
 const MICRO_DELAY_MAX_MS = parseInt(process.env.MICRO_DELAY_MAX_MS || "1200", 10);
 
-// Behavior timing
+// Per your spec
 const FEED_INITIAL_WAIT_MS = parseInt(process.env.FEED_INITIAL_WAIT_MS || "10000", 10);   // ~10s
-const FEED_SCROLL_MS       = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);         // ~5s
+const FEED_SCROLL_MS = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);               // ~5s
 const PROFILE_INITIAL_WAIT_MS = parseInt(process.env.PROFILE_INITIAL_WAIT_MS || "10000", 10); // ~10s
 
 // Fallbacks
@@ -77,9 +72,16 @@ const FORCE_RELOGIN = (/^(true|1|yes)$/i).test(process.env.FORCE_RELOGIN || "fal
 const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "true");
 const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10); // 5 min
 
+// Proxy (optional)
+const PROXY_SERVER = process.env.PROXY_SERVER || null;           // e.g. "http://host:port"
+const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || null;
+
 // Playwright (lazy import)
 let chromium = null;
 
+// =========================
+// Small utils
 // =========================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -133,7 +135,7 @@ async function apiPost(p, body) {
 // Per-domain throttle
 // =========================
 class DomainThrottle {
-  constructor() { this.state = new Map(); }
+  constructor() { this.state = new Map(); } // domain -> { lastActionAt, events: number[], cooldownUntil }
   _get(domain) {
     if (!this.state.has(domain)) this.state.set(domain, { lastActionAt: 0, events: [], cooldownUntil: 0 });
     return this.state.get(domain);
@@ -167,13 +169,14 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers
+/* Playwright helpers */
 // =========================
 async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   if (!chromium) ({ chromium } = require("playwright"));
 
-  // Build launch options (with optional proxy + WebRTC leak hardening)
-  const launchOptions = {
+  try { await fs.promises.mkdir(path.dirname(userStatePath || DEFAULT_STATE_PATH), { recursive: true }); } catch {}
+
+  const launchOpts = {
     headless: !!headless,
     slowMo: SLOWMO_MS,
     args: [
@@ -181,22 +184,19 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-features=IsolateOrigins,site-per-process",
-      // prevent WebRTC IP leaks
       "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--webrtc-stun-probe-trial=disabled"
+      "--webrtc-stun-probe-trial=disabled",
     ],
   };
   if (PROXY_SERVER) {
-    launchOptions.proxy = {
-      server: PROXY_SERVER,            // e.g. "http://host:port"
+    launchOpts.proxy = {
+      server: PROXY_SERVER,
       username: PROXY_USERNAME || undefined,
       password: PROXY_PASSWORD || undefined,
     };
   }
 
-  try { await fs.promises.mkdir(path.dirname(userStatePath || DEFAULT_STATE_PATH), { recursive: true }); } catch {}
-
-  const browser = await chromium.launch(launchOptions);
+  const browser = await chromium.launch(launchOpts);
 
   const vw = 1280 + Math.floor(Math.random() * 192);
   const vh = 720 + Math.floor(Math.random() * 160);
@@ -206,9 +206,9 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
     : (!FORCE_RELOGIN && fs.existsSync(DEFAULT_STATE_PATH) ? DEFAULT_STATE_PATH : undefined);
 
   const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "en-US",
-    timezoneId: "Asia/Kolkata", // consistent with user timezone
+    timezoneId: "America/Los_Angeles",
     colorScheme: "light",
     viewport: { width: vw, height: vh },
     javaScriptEnabled: true,
@@ -217,7 +217,7 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   });
 
   await context.setExtraHTTPHeaders({
-    "accept-language": "en-IN,en;q=0.9",
+    "accept-language": "en-US,en;q=0.9",
     "upgrade-insecure-requests": "1",
     "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"',
     "sec-ch-ua-platform": '"Windows"',
@@ -233,7 +233,7 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
       Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
       Object.defineProperty(navigator, "userAgent", {
         get: () =>
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
       });
       const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
       if (originalQuery) {
@@ -244,8 +244,8 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(35000);
-  page.setDefaultNavigationTimeout(45000);
+  page.setDefaultTimeout(35000);            // generous
+  page.setDefaultNavigationTimeout(45000);  // generous
 
   // Optional cookie bundle (augments storageState)
   if (cookieBundle && (cookieBundle.li_at || cookieBundle.jsessionid || cookieBundle.bcookie)) {
@@ -306,7 +306,7 @@ async function isAuthWalledOrGuest(page) {
 async function ensureAuthenticated(context, page, userStatePath) {
   const before = await cookieDiag(context);
 
-  // Desktop feed once
+  // Try desktop feed once
   try {
     const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     const s = r ? r.status() : null;
@@ -316,17 +316,15 @@ async function ensureAuthenticated(context, page, userStatePath) {
     }
   } catch {}
 
-  // Mobile feed fallback once
-  if (ALLOW_MOBILE_FALLBACK) {
-    try {
-      const r = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
-      const s = r ? r.status() : null;
-      if (s && s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
-        await saveStorageState(context, userStatePath || DEFAULT_STATE_PATH);
-        return { ok: true, via: "mobile", status: s, url: page.url(), diag: before };
-      }
-    } catch {}
-  }
+  // Mobile feed fallback (single fallback only)
+  try {
+    const r = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
+    const s = r ? r.status() : null;
+    if (s && s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
+      await saveStorageState(context, userStatePath || DEFAULT_STATE_PATH);
+      return { ok: true, via: "mobile", status: s, url: page.url(), diag: before };
+    }
+  } catch {}
 
   // Optional interactive login once
   if (!ALLOW_INTERACTIVE_LOGIN) {
@@ -374,41 +372,40 @@ async function navigateProfileClean(page, rawUrl) {
 
   // First attempt
   try {
-    const u = attempts[0];
-    const resp = await page.goto(u, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const resp = await page.goto(attempts[0], { waitUntil: "domcontentloaded", timeout: 30000 });
     const status = resp ? resp.status() : null;
     const authed = !(await isAuthWalledOrGuest(page));
     const finalUrl = page.url();
     const hard = await detectHardScreen(page);
-    if (status === 429 || hard === "429") return { authed: false, status: 429, usedUrl: u, finalUrl, error: "rate_limited" };
-    if (hard === "404") return { authed: false, status: status || 404, usedUrl: u, finalUrl, error: "not_found" };
+    if (status === 429 || hard === "429") return { authed: false, status: 429, usedUrl: attempts[0], finalUrl, error: "rate_limited" };
+    if (hard === "404") return { authed: false, status: status || 404, usedUrl: attempts[0], finalUrl, error: "not_found" };
     if (authed && status && status >= 200 && status < 400 && !hard) {
-      return { authed: true, status, usedUrl: u, finalUrl };
+      return { authed: true, status, usedUrl: attempts[0], finalUrl };
     }
   } catch (e) {
-    // fallthrough to fallback
+    // fall through
   }
 
-  // Fallback once (if configured)
+  // Optional single fallback
   if (attempts[1]) {
     try {
-      const u = attempts[1];
-      const resp = await page.goto(u, { waitUntil: "domcontentloaded", timeout: 30000 });
+      const resp = await page.goto(attempts[1], { waitUntil: "domcontentloaded", timeout: 30000 });
       const status = resp ? resp.status() : null;
       const authed = !(await isAuthWalledOrGuest(page));
       const finalUrl = page.url();
       const hard = await detectHardScreen(page);
-      if (status === 429 || hard === "429") return { authed: false, status: 429, usedUrl: u, finalUrl, error: "rate_limited" };
-      if (hard === "404") return { authed: false, status: status || 404, usedUrl: u, finalUrl, error: "not_found" };
+      if (status === 429 || hard === "429") return { authed: false, status: 429, usedUrl: attempts[1], finalUrl, error: "rate_limited" };
+      if (hard === "404") return { authed: false, status: status || 404, usedUrl: attempts[1], finalUrl, error: "not_found" };
       if (authed && status && status >= 200 && status < 400 && !hard) {
-        return { authed: true, status, usedUrl: u, finalUrl };
+        return { authed: true, status, usedUrl: attempts[1], finalUrl };
       }
-      return { authed: false, status, usedUrl: u, finalUrl, error: "authwall_or_unknown" };
+      return { authed: false, status, usedUrl: attempts[1], finalUrl, error: "authwall_or_unknown" };
     } catch (e) {
       return { authed: false, status: null, usedUrl: attempts[1], finalUrl: page.url(), error: e?.message || "nav_failed" };
     }
   }
 
+  // If both fail
   return { authed: false, status: null, usedUrl: attempts[0], finalUrl: page.url(), error: "authwall_or_unknown" };
 }
 
@@ -421,18 +418,18 @@ async function humanScroll(page, durationMs = 2000) {
   }
 }
 
-// FEED warmup with exact behavior
+// FEED warmup exactly as requested (no refresh)
 async function feedWarmup(page) {
   try {
     if (!/linkedin\.com\/feed\/?$/i.test(page.url())) {
       await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     }
-    await sleep(FEED_INITIAL_WAIT_MS);   // ~10s
-    await humanScroll(page, FEED_SCROLL_MS); // ~5s
+    await sleep(FEED_INITIAL_WAIT_MS);   // wait ~10s
+    await humanScroll(page, FEED_SCROLL_MS); // scroll ~5s
   } catch {}
 }
 
-// “See more” utility
+// Scroll to a section and expand “See more” if present
 async function scrollAndExpand(page, sectionLocator) {
   try {
     await sectionLocator.scrollIntoViewIfNeeded().catch(()=>{});
@@ -446,6 +443,7 @@ async function scrollAndExpand(page, sectionLocator) {
   } catch {}
 }
 
+// Extract innerText of a locator safely
 async function safeInnerText(loc) {
   try {
     if (await loc.first().isVisible({ timeout: 1800 }).catch(()=>false)) {
@@ -458,7 +456,8 @@ async function safeInnerText(loc) {
 
 // Scrape About + current role (patient)
 async function scrapeAboutAndCurrentRole(page) {
-  await sleep(PROFILE_INITIAL_WAIT_MS); // let profile settle
+  // Let profile settle (another ~10s)
+  await sleep(PROFILE_INITIAL_WAIT_MS);
 
   // ABOUT
   const aboutSection = page.locator('section[id="about"], section:has(h2:has-text("About"))').first();
@@ -477,6 +476,7 @@ async function scrapeAboutAndCurrentRole(page) {
     (await safeInnerText(firstItem.locator('.inline-show-more-text, .pvs-list__outer-container, [data-test="experience-item"]').first())) ||
     (await safeInnerText(firstItem));
 
+  // Trim to sane sizes
   const clip = (s, n=4000) => (s && s.length > n ? s.slice(0, n) : s) || "";
   return {
     about: clip(aboutText),
@@ -498,8 +498,8 @@ async function detectRelationshipStatus(page) {
     try {
       const visible = await c.loc.first().isVisible({ timeout: 1200 }).catch(() => false);
       if (visible) {
-        if (c.type === "connected")   return { status: "connected", reason: "Message CTA visible" };
-        if (c.type === "pending")     return { status: "pending", reason: "Pending/Requested visible" };
+        if (c.type === "connected")   return { status: "connected",     reason: "Message CTA visible" };
+        if (c.type === "pending")     return { status: "pending",       reason: "Pending/Requested visible" };
         if (c.type === "can_connect") return { status: "not_connected" };
       }
     } catch {}
@@ -567,7 +567,7 @@ async function openConnectDialog(page) {
       const dialogReady = await Promise.race([
         page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
         page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
-        page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3500 }).then () => true).catch(() => false),
+        page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
       ]);
       if (dialogReady) return { opened: true, via: "mobile_primary" };
     }
@@ -779,14 +779,14 @@ async function handleAuthCheck(job) {
   const userId = payload?.userId || "default";
   const userStatePath = statePathForUser(userId);
 
-  let browser, context, page, videoHandle;
+  let browser, context, page;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle: null, userStatePath }));
-    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     const auth = await ensureAuthenticated(context, page, userStatePath);
 
+    // After login/auth, land on feed ONCE and do warmup (no extra refresh)
     if (auth.ok) { await feedWarmup(page); }
 
     const result = {
@@ -801,7 +801,6 @@ async function handleAuthCheck(job) {
 
     try { await context.tracing.stop({ path: "/tmp/trace-auth.zip" }); } catch {}
     await browser.close().catch(() => {});
-    if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
     return result;
   } catch (e) {
     try { await context?.tracing?.stop({ path: "/tmp/trace-auth-failed.zip" }).catch(()=>{}); } catch {}
@@ -845,10 +844,9 @@ async function handleSendConnection(job) {
 
   await throttle.reserve("linkedin.com", "SEND_CONNECTION");
 
-  let browser, context, page, videoHandle;
+  let browser, context, page;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
-    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     // AUTH + feed warmup (single feed view only)
@@ -865,7 +863,7 @@ async function handleSendConnection(job) {
       throttle.failure("linkedin.com");
       return result;
     }
-    await feedWarmup(page); // wait 10s + scroll 5s
+    await feedWarmup(page); // wait 10s + scroll 5s (no refresh)
 
     // PROFILE nav (single attempt + optional single fallback)
     const nav = await navigateProfileClean(page, targetUrl);
@@ -881,7 +879,7 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // Wait calmly on profile, then bail if we see hard screens
+    // Wait calmly on profile per your spec, then bail if we see hard screens
     await sleep(PROFILE_INITIAL_WAIT_MS);
     const hard = await detectHardScreen(page);
     if (hard === "404" || hard === "429" || hard === "captcha") {
@@ -899,7 +897,7 @@ async function handleSendConnection(job) {
       return result;
     }
 
-    // SCRAPE sections (patient)
+    // SCRAPE sections (patient, expands See more)
     const { about, currentRole } = await scrapeAboutAndCurrentRole(page);
 
     // CONNECT
@@ -985,10 +983,9 @@ async function handleSendMessage(job) {
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
 
-  let browser, context, page, videoHandle;
+  let browser, context, page;
   try {
     ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
-    videoHandle = page.video?.();
     await context.tracing.start({ screenshots: true, snapshots: false });
 
     const auth = await ensureAuthenticated(context, page, userStatePath);
@@ -1040,6 +1037,7 @@ async function handleSendMessage(job) {
     const outcome = await sendMessageFlow(page, messageText);
     await microDelay();
 
+    // linger slightly
     await sleep(1500);
 
     const result = {
@@ -1115,7 +1113,7 @@ async function processOne() {
 }
 
 async function mainLoop() {
-  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE} Proxy: ${PROXY_SERVER ? "ON" : "OFF"}`);
+  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
   if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
 
   try {

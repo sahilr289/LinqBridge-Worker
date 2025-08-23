@@ -1,13 +1,14 @@
-// worker.cjs — LinqBridge Worker (robust, calm nav, hard 429/404 guard, minimal refreshes)
+// worker.cjs — LinqBridge Worker (robust, calm nav, hard 429/404 guard, minimal refreshes, proxy + WebRTC safe)
 //
-// What this version guarantees (per your ask):
+// Guarantees (per your ask):
 // 1) After login, FEED: wait ~10s, then scroll ~5s. No extra feed refreshes.
-// 2) PROFILE: navigate once (mobile fallback only if strictly needed), then wait ~10s. No refresh loops.
-// 3) Scraping waits patiently and expands "See more" where present.
-// 4) Connect button is tried directly and under "More".
-// 5) Upfront guard rejects /in/ACo… or /in/ACw… “URN-like” slugs (prevents 404 loops).
-// 6) Post-nav 429/404 detection bails early and triggers a long cooldown.
-// 7) Conservative throttling by default to avoid 429s (override with env if you want).
+// 2) PROFILE: navigate once (optional single mobile fallback), then wait ~10s. No refresh loops.
+// 3) Patient scraping with "See more" expansion.
+// 4) Connect via primary button or under "More".
+// 5) Upfront guard rejects /in/ACo… or /in/ACw… URN-like slugs.
+// 6) Post-nav 429/404/captcha detection bails and triggers cooldown.
+// 7) Conservative throttling to avoid 429s (override via env).
+// 8) NEW: Proxy support + WebRTC UDP leak block + India timezone/headers via env.
 
 const path = require("path");
 const fs = require("fs");
@@ -63,6 +64,12 @@ const PROFILE_INITIAL_WAIT_MS = parseInt(process.env.PROFILE_INITIAL_WAIT_MS || 
 
 // Fallbacks
 const ALLOW_MOBILE_FALLBACK = (/^(true|1|yes)$/i).test(process.env.ALLOW_MOBILE_FALLBACK || "true");
+
+// Locale/timezone headers (overridable via env)
+const TIMEZONE = process.env.TIMEZONE || "Asia/Kolkata";
+const ACCEPT_LANGUAGE = process.env.ACCEPT_LANGUAGE || "en-IN,en;q=0.9";
+const PRIMARY_LANG = (ACCEPT_LANGUAGE.split(",")[0] || "en-IN").split(";")[0];
+const LOCALE = process.env.LOCALE || PRIMARY_LANG;
 
 // Session persistence / interactive login
 const DEFAULT_STATE_PATH = process.env.STORAGE_STATE_PATH || "/app/auth-state.json";
@@ -163,21 +170,35 @@ class DomainThrottle {
 const throttle = new DomainThrottle();
 
 // =========================
-// Playwright helpers
+/** Playwright helpers **/
 // =========================
 async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   if (!chromium) ({ chromium } = require("playwright"));
+
+  // Proxy config from env (supports "username in PROXY_USERNAME" and optional PROXY_PASSWORD)
+  const proxyConfig = process.env.PROXY_SERVER
+    ? {
+        server: process.env.PROXY_SERVER,                  // e.g. "http://geo.iproyal.com:12321"
+        username: process.env.PROXY_USERNAME || undefined, // full sticky username string or user
+        password: process.env.PROXY_PASSWORD || undefined, // leave empty if creds embedded in username
+      }
+    : undefined;
 
   try { await fs.promises.mkdir(path.dirname(userStatePath || DEFAULT_STATE_PATH), { recursive: true }); } catch {}
 
   const browser = await chromium.launch({
     headless: !!headless,
+    proxy: proxyConfig,                 // <— NEW (proxy)
     slowMo: SLOWMO_MS,
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--disable-features=IsolateOrigins,site-per-process"
+      "--disable-features=IsolateOrigins,site-per-process",
+      // WebRTC leak hardening (forces traffic via proxy)
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--webrtc-stun-probe-trial=disabled",
+      `--lang=${PRIMARY_LANG}`,
     ],
   });
 
@@ -190,8 +211,8 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
 
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    locale: "en-US",
-    timezoneId: "America/Los_Angeles",
+    locale: LOCALE,                        // <— NEW (from env)
+    timezoneId: TIMEZONE,                  // <— NEW (from env; defaults Asia/Kolkata)
     colorScheme: "light",
     viewport: { width: vw, height: vh },
     javaScriptEnabled: true,
@@ -200,7 +221,7 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
   });
 
   await context.setExtraHTTPHeaders({
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": ACCEPT_LANGUAGE,    // <— NEW (from env)
     "upgrade-insecure-requests": "1",
     "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"',
     "sec-ch-ua-platform": '"Windows"',
@@ -208,12 +229,13 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
     "referer": "https://www.google.com/"
   });
 
-  await context.addInitScript(() => {
+  // Init script with env-driven language hints
+  await context.addInitScript(({ primary, langs }) => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     try {
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
-      Object.defineProperty(navigator, "language", { get: () => "en-US" });
-      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      Object.defineProperty(navigator, "language", { get: () => primary });
+      Object.defineProperty(navigator, "languages", { get: () => langs });
       Object.defineProperty(navigator, "userAgent", {
         get: () =>
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -224,7 +246,7 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
           p?.name === "notifications" ? Promise.resolve({ state: "denied" }) : originalQuery(p);
       }
     } catch {}
-  });
+  }, { primary: PRIMARY_LANG, langs: ACCEPT_LANGUAGE.split(",").map(s => s.split(";")[0].trim()).filter(Boolean) });
 
   const page = await context.newPage();
   page.setDefaultTimeout(35000);            // generous
@@ -326,7 +348,7 @@ async function ensureAuthenticated(context, page, userStatePath) {
   return { ok: false, reason: "interactive_timeout", url: page.url(), diag: before };
 }
 
-// ========= NEW: URL/slug + hard-screen helpers =========
+// ========= URL/slug + hard-screen helpers =========
 function extractInSlug(u) {
   const m = String(u || "").match(/linkedin\.com\/in\/([^\/?#]+)/i);
   return m ? decodeURIComponent(m[1]) : null;
@@ -371,12 +393,10 @@ async function navigateProfileClean(page, rawUrl) {
     } catch (e) {
       firstError = firstError || { status: null, usedUrl: u, finalUrl: page.url(), error: e?.message || "nav_failed" };
     }
-    // single attempt + optional single fallback only — no loops
-    break; // break after first attempt if fallback not allowed, else loop will run once more
+    break; // single attempt; fallback (if any) handled below
   }
 
   if (attempts.length > 1) {
-    // Try fallback once (the second item)
     const u = attempts[1];
     try {
       const resp = await page.goto(u, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -413,9 +433,8 @@ async function feedWarmup(page) {
     if (!/linkedin\.com\/feed\/?$/i.test(page.url())) {
       await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 30000 });
     }
-    // Wait ~10s, then scroll ~5s — no extra refreshes
-    await sleep(FEED_INITIAL_WAIT_MS);
-    await humanScroll(page, FEED_SCROLL_MS);
+    await sleep(FEED_INITIAL_WAIT_MS);   // ~10s
+    await humanScroll(page, FEED_SCROLL_MS); // ~5s
   } catch {}
 }
 

@@ -1,4 +1,4 @@
-// worker.cjs — LinqBridge Worker (with fix for refresh loop)
+// worker.cjs — LinqBridge Worker (two-tab, calm nav, 429/404 guard, proxy-ready)
 //
 // What this version does (per your asks):
 // 1) After login, TAB 1 (feed): wait ~10s, then scroll ~5s. No refresh loops.
@@ -741,139 +741,409 @@ async function clickSendInComposer(page) {
     try {
       if (await s.first().isVisible({ timeout: 1500 }).catch(() => false)) {
         await s.first().click({ timeout: 4000 }); await microDelay();
-        const closed = await page.getByRole("dialog").waitFor({ state: "detached", timeout: 5000 }).then(() => true).catch(() => false);
-        if (closed) return true;
+        const sent = await Promise.race([
+          page.locator('div:has-text("Message sent")').waitFor({ timeout: 4000 }).then(() => true).catch(() => false),
+          page.locator('.msg-form__contenteditable[contenteditable="true"]').evaluate(el => (el.innerText || "").trim().length === 0).catch(() => false),
+          sleep(1500).then(() => true),
+        ]);
+        if (sent) return true;
       }
     } catch {}
   }
+  try {
+    const editor = page.locator('.msg-form__contenteditable[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea').first();
+    if (await editor.isVisible({ timeout: 800 }).catch(() => false)) {
+      await editor.press("Enter").catch(()=>{});
+      await microDelay();
+      const sentByEnter = await Promise.race([
+        page.locator('div:has-text("Message sent")').waitFor({ timeout: 2000 }).then(() => true).catch(() => false),
+        sleep(1500).then(() => true),
+      ]);
+      if (sentByEnter) return true;
+      await editor.press("Control+Enter").catch(()=>{});
+      await microDelay();
+      const sentByCtrlEnter = await Promise.race([
+        page.locator('div:has-text("Message sent")').waitFor({ timeout: 2000 }).then(() => true).catch(() => false),
+        sleep(1500).then(() => true),
+      ]);
+      if (sentByCtrlEnter) return true;
+    }
+  } catch {}
   return false;
 }
 
-async function sendMessage(page, text) {
-  let opened = await openMessageDialog(page);
-  if (!opened.opened) return { actionTaken: "unavailable", details: "Message button not found" };
-
-  const typed = await typeIntoComposer(page, text);
-  if (!typed) return { actionTaken: "failed_to_type", details: "Failed to find message composer" };
-
+async function sendMessageFlow(page, messageText) {
+  const rs = await detectRelationshipStatus(page);
+  if (rs.status !== "connected") {
+    return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
+  }
+  const opened = await openMessageDialog(page);
+  if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
+  await microDelay();
+  const typed = await typeIntoComposer(page, messageText);
+  if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Could not type into composer" };
+  await microDelay();
   const sent = await clickSendInComposer(page);
-  if (!sent) return { actionTaken: "failed_to_send", details: "Failed to find send button" };
-
-  return { actionTaken: "sent", details: "Message sent successfully" };
+  if (sent) return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent" };
+  return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Failed to send message" };
 }
 
 // =========================
-// Main job processing loop
+// Job handlers
 // =========================
-async function processJob(job, browser) {
-  const { id, type, data } = job;
-  const { user_id, profile_url, cookie_bundle, note } = data;
-  const userStatePath = userStatePathForUser(user_id);
-  const userLogPrefix = `[job:${id}] [user:${user_id}]`;
+async function handleAuthCheck(job) {
+  const { payload } = job || {};
+  const userId = payload?.userId || "default";
+  const userStatePath = statePathForUser(userId);
 
-  console.log(`${userLogPrefix} Processing job: ${type} for ${profile_url || "feed"}`);
+  let browser, context, page, videoHandle;
+  try {
+    ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, cookieBundle: null, userStatePath }));
+    videoHandle = page.video?.();
 
-  // Create a new context and page for this job
-  const { context, page } = await createBrowserContext({
-    cookieBundle: cookie_bundle,
-    headless: HEADLESS,
-    userStatePath: userStatePath
-  });
+    const auth = await ensureAuthenticated(context, page, userStatePath);
+    if (auth.ok) {
+      // After auth, warm the feed ONCE on TAB 1
+      await feedWarmup(page);
+    }
+
+    const result = {
+      ok: !!auth.ok,
+      via: auth.via || "unknown",
+      url: auth.url || null,
+      diag: auth.diag || null,
+      message: auth.ok ? "Authenticated and storageState saved." : `Auth failed: ${auth.reason || "unknown"}`,
+      at: new Date().toISOString(),
+      statePath: userStatePath,
+    };
+
+    await browser.close().catch(() => {});
+    if (videoHandle) { try { console.log("[video] saved:", await videoHandle.path()); } catch {} }
+    return result;
+  } catch (e) {
+    try { await browser?.close(); } catch {}
+    throw new Error(`AUTH_CHECK failed: ${e.message}`);
+  }
+}
+
+async function handleSendConnection(job) {
+  const { payload } = job || {};
+  if (!payload) throw new Error("Job has no payload");
+  let targetUrl = payload.profileUrl || null;
+  if (!targetUrl && payload.publicIdentifier) {
+    targetUrl = `https://www.linkedin.com/in/${encodeURIComponent(payload.publicIdentifier)}/`;
+  }
+  if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
+
+  // Upfront bad-slug guard
+  const slug = extractInSlug(targetUrl);
+  if (slug && looksLikeUrnSlug(slug)) {
+    throttle.failure("linkedin.com");
+    return {
+      mode: "real",
+      profileUrl: targetUrl,
+      actionTaken: "invalid_profile_url",
+      relationshipStatus: "unknown",
+      details: "Provided /in/ URL looks like an internal URN (ACo/ACw). Needs a real public slug.",
+      at: new Date().toISOString(),
+    };
+  }
+
+  const note = payload.note || null;
+  const cookieBundle = payload.cookieBundle || {};
+  const userId = payload.userId || "default";
+  const userStatePath = statePathForUser(userId);
+
+  if (SOFT_MODE) {
+    await throttle.reserve("linkedin.com", "SOFT send_connection"); await microDelay(); throttle.success("linkedin.com");
+    return { mode: "soft", profileUrl: targetUrl, noteUsed: note, message: "Soft mode success (no browser).", at: new Date().toISOString() };
+  }
+
+  await throttle.reserve("linkedin.com", "SEND_CONNECTION");
+
+  let browser, context, feedPage, profilePage, videoHandle;
+  try {
+    ({ browser, context, page: feedPage } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
+    videoHandle = feedPage.video?.();
+
+    // AUTH on TAB 1 (feed)
+    const auth = await ensureAuthenticated(context, feedPage, userStatePath);
+    if (!auth.ok) {
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: "preflight", finalUrl: auth.url,
+        httpStatus: null, relationshipStatus: "not_connected", actionTaken: "unavailable",
+        details: "Not authenticated (guest/authwall). Complete 2FA or refresh cookies.",
+        authDiag: auth.diag, at: new Date().toISOString(),
+      };
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    // Feed warmup (TAB 1)
+    await feedWarmup(feedPage);
+
+    // Open TAB 2 for profile work
+    profilePage = await newPageInContext(context);
+
+    // PROFILE nav (single attempt + optional single fallback)
+    const nav = await navigateProfileClean(profilePage, targetUrl);
+    if (!nav.authed) {
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || profilePage.url(),
+        httpStatus: nav.status, relationshipStatus: "not_connected", actionTaken: "unavailable",
+        details: nav.error || "Authwall/404/429 on profile nav.", at: new Date().toISOString(),
+      };
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    // Wait calmly on profile per spec, then hard-screen check
+    await sleep(PROFILE_INITIAL_WAIT_MS);
+    const hard = await detectHardScreen(profilePage);
+    if (hard === "404" || hard === "429" || hard === "captcha") {
+      const details = hard === "404" ? "Public profile URL returned 404."
+                    : hard === "429" ? "Hit LinkedIn 429 (rate-limited)."
+                    : "Encountered verification/captcha.";
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: profilePage.url(),
+        httpStatus: nav.status, relationshipStatus: "unknown", actionTaken: hard === "404" ? "page_not_found" : "rate_limited",
+        details, at: new Date().toISOString(),
+      };
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    // SCRAPE sections (TAB 2)
+    const { about, currentRole } = await scrapeAboutAndCurrentRole(profilePage);
+
+    // CONNECT (TAB 2)
+    await microDelay();
+    const connectOutcome = await sendConnectionRequest(profilePage, note);
+
+    // linger 2s then close TAB 2
+    await sleep(2000);
+    try { await profilePage.close().catch(()=>{}); } catch {}
+
+    const result = {
+      mode: "real",
+      profileUrl: targetUrl,
+      usedUrl: nav.usedUrl,
+      finalUrl: nav.finalUrl || profilePage?.url?.() || "",
+      noteUsed: note,
+      httpStatus: nav.status,
+      relationshipStatus: connectOutcome.relationshipStatus,
+      actionTaken: connectOutcome.actionTaken,
+      details: connectOutcome.details,
+      scraped: {
+        aboutLength: about ? about.length : 0,
+        currentRoleLength: currentRole ? currentRole.length : 0,
+        about,
+        currentRole,
+      },
+      at: new Date().toISOString(),
+    };
+
+    await browser.close().catch(() => {});
+
+    if (connectOutcome.actionTaken === "sent" || connectOutcome.actionTaken === "sent_maybe") throttle.success("linkedin.com");
+    else if (connectOutcome.actionTaken === "failed_to_send" || connectOutcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
+    else throttle.success("linkedin.com");
+
+    return result;
+  } catch (e) {
+    try { await profilePage?.close()?.catch(()=>{}); } catch {}
+    try { await browser?.close(); } catch {}
+    throttle.failure("linkedin.com");
+    throw new Error(`SEND_CONNECTION failed: ${e.message}`);
+  }
+}
+
+async function handleSendMessage(job) {
+  const { payload } = job || {};
+  if (!payload) throw new Error("Job has no payload");
+
+  let targetUrl = payload.profileUrl || null;
+  if (!targetUrl && payload.publicIdentifier) {
+    targetUrl = `https://www.linkedin.com/in/${encodeURIComponent(payload.publicIdentifier)}/`;
+  }
+  if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
+
+  // Upfront bad-slug guard
+  const slug = extractInSlug(targetUrl);
+  if (slug && looksLikeUrnSlug(slug)) {
+    throttle.failure("linkedin.com");
+    return {
+      mode: "real",
+      profileUrl: targetUrl,
+      actionTaken: "invalid_profile_url",
+      relationshipStatus: "unknown",
+      details: "Provided /in/ URL looks like an internal URN (ACo/ACw). Needs a real public slug.",
+      at: new Date().toISOString(),
+    };
+  }
+
+  const messageText = payload.message;
+  if (!messageText) throw new Error("payload.message required");
+
+  const cookieBundle = payload.cookieBundle || {};
+  const userId = payload.userId || "default";
+  const userStatePath = statePathForUser(userId);
+
+  if (SOFT_MODE) {
+    await throttle.reserve("linkedin.com", "SOFT send_message"); await microDelay(); throttle.success("linkedin.com");
+    return { mode: "soft", profileUrl: targetUrl, messageUsed: messageText, message: "Soft mode success (no browser).", at: new Date().toISOString() };
+  }
+
+  await throttle.reserve("linkedin.com", "SEND_MESSAGE");
+
+  let browser, context, feedPage, profilePage, videoHandle;
+  try {
+    ({ browser, context, page: feedPage } = await createBrowserContext({ headless: HEADLESS, cookieBundle, userStatePath }));
+    videoHandle = feedPage.video?.();
+
+    const auth = await ensureAuthenticated(context, feedPage, userStatePath);
+    if (!auth.ok) {
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: "preflight", finalUrl: auth.url,
+        httpStatus: null, relationshipStatus: "unknown", actionTaken: "unavailable",
+        details: "Not authenticated (guest/authwall). Complete 2FA or refresh cookies.",
+        authDiag: auth.diag, at: new Date().toISOString(),
+      };
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    await feedWarmup(feedPage);
+
+    // TAB 2
+    profilePage = await newPageInContext(context);
+
+    const nav = await navigateProfileClean(profilePage, targetUrl);
+    if (!nav.authed) {
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl || profilePage.url(),
+        httpStatus: nav.status, relationshipStatus: "unknown", actionTaken: "unavailable",
+        details: nav.error || "Authwall/404/429 on profile nav.", at: new Date().toISOString(),
+      };
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    await sleep(PROFILE_INITIAL_WAIT_MS);
+    const hard = await detectHardScreen(profilePage);
+    if (hard === "404" || hard === "429" || hard === "captcha") {
+      const details = hard === "404" ? "Public profile URL returned 404."
+                    : hard === "429" ? "Hit LinkedIn 429 (rate-limited)."
+                    : "Encountered verification/captcha.";
+      const result = {
+        mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: profilePage.url(),
+        httpStatus: nav.status, relationshipStatus: "unknown", actionTaken: hard === "404" ? "page_not_found" : "rate_limited",
+        details, at: new Date().toISOString(),
+      };
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(() => {});
+      throttle.failure("linkedin.com");
+      return result;
+    }
+
+    const outcome = await sendMessageFlow(profilePage, messageText);
+    await microDelay();
+
+    await sleep(1500);
+    try { await profilePage.close().catch(()=>{}); } catch {}
+
+    const result = {
+      mode: "real",
+      profileUrl: targetUrl,
+      usedUrl: nav.usedUrl,
+      finalUrl: nav.finalUrl || profilePage?.url?.() || "",
+      messageUsed: messageText,
+      httpStatus: nav.status,
+      relationshipStatus: outcome.relationshipStatus,
+      actionTaken: outcome.actionTaken,
+      details: outcome.details,
+      at: new Date().toISOString(),
+    };
+
+    await browser.close().catch(() => {});
+
+    if (outcome.actionTaken === "sent") throttle.success("linkedin.com");
+    else if (outcome.actionTaken?.startsWith("failed") || outcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
+    else throttle.success("linkedin.com");
+
+    return result;
+  } catch (e) {
+    try { await profilePage?.close()?.catch(()=>{}); } catch {}
+    try { await browser?.close(); } catch {}
+    throttle.failure("linkedin.com");
+    throw new Error(`SEND_MESSAGE failed: ${e.message}`);
+  }
+}
+
+// =========================
+// Job loop
+// =========================
+async function processOne() {
+  let next;
+  try {
+    next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE"] });
+  } catch (e) {
+    logFetchError("jobs/next", e);
+    return;
+  }
+
+  const job = next?.job;
+  if (!job) return;
 
   try {
-    // 1. Ensure we are authenticated and ready
-    const authResult = await ensureAuthenticated(context, page, userStatePath);
-    if (!authResult.ok) {
-      console.error(`${userLogPrefix} Authentication failed: ${authResult.reason} - Bailing out.`);
-      // IMPORTANT: update job status on backend and apply a long cooldown
-      await apiPost(`/jobs/${id}/fail`, { error: `Authentication failed: ${authResult.reason}` });
-      await sleep(COOLDOWN_AFTER_FAIL_MS);
-      return;
-    }
-    console.log(`${userLogPrefix} Authentication successful via ${authResult.via}. Proceeding...`);
-
-    // 2. Perform the feed warmup if it's the first time
-    if (!profile_url) {
-      await feedWarmup(page);
-      console.log(`${userLogPrefix} Feed warmup complete.`);
-      await apiPost(`/jobs/${id}/complete`, { status: "feed_warmed_up" });
-    }
-    
-    // 3. Process a specific profile
-    if (profile_url) {
-        const slug = extractInSlug(profile_url);
-        if (looksLikeUrnSlug(slug)) {
-            console.error(`${userLogPrefix} Skipping invalid URN slug: ${slug}`);
-            await apiPost(`/jobs/${id}/fail`, { error: "Invalid profile URL (URN slug)" });
-            return;
-        }
-
-        const navResult = await navigateProfileClean(page, profile_url);
-        if (!navResult.authed) {
-          console.error(`${userLogPrefix} Profile navigation failed: ${navResult.error}`);
-          await apiPost(`/jobs/${id}/fail`, { error: `Profile navigation failed: ${navResult.error}` });
-          return;
-        }
-        
-        // Scrape
-        console.log(`${userLogPrefix} Scraping profile...`);
-        const scrapedData = await scrapeAboutAndCurrentRole(page);
-        console.log(`${userLogPrefix} Scraped data:`, scrapedData);
-        await apiPost(`/jobs/${id}/update`, { data: scrapedData });
-
-        // Connect
-        if (type === "connect") {
-            await throttle.reserve("linkedin.com", "connect");
-            console.log(`${userLogPrefix} Attempting to send connection request...`);
-            const connectResult = await sendConnectionRequest(page, note);
-            console.log(`${userLogPrefix} Connection result:`, connectResult);
-            if (connectResult.actionTaken === "sent" || connectResult.actionTaken === "sent_maybe") {
-                await throttle.success("linkedin.com");
-                await apiPost(`/jobs/${id}/complete`, { status: "sent", result: connectResult });
-            } else {
-                await throttle.failure("linkedin.com");
-                await apiPost(`/jobs/${id}/fail`, { error: "Failed to send connection request", result: connectResult });
-            }
-        }
+    let result = null;
+    switch (job.type) {
+      case "AUTH_CHECK":      result = await handleAuthCheck(job); break;
+      case "SEND_CONNECTION": result = await handleSendConnection(job); break;
+      case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
+      default: result = { note: `Unhandled job type: ${job.type}` }; break;
     }
 
-  } catch (error) {
-    console.error(`${userLogPrefix} An unhandled error occurred during job execution:`, error);
-    await apiPost(`/jobs/${id}/fail`, { error: "Unhandled worker error", details: error?.message || "Unknown" }).catch(e => logFetchError("job-fail-post", e));
-  } finally {
-    try { await context.close(); } catch (e) { console.error(`${userLogPrefix} Failed to close context:`, e); }
-  }
-}
-
-// =========================
-// Main loop
-// =========================
-async function pollForJobs() {
-  let browser = null;
-  while (true) {
     try {
-      console.log(`[main] Polling for jobs from ${API_BASE}...`);
-      const jobs = await apiGet("/jobs/next");
-      if (!jobs || jobs.length === 0) {
-        console.log("[main] No jobs found. Sleeping.");
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
-
-      for (const job of jobs) {
-        await processJob(job, browser);
-      }
+      await apiPost(`/jobs/${job.id}/complete`, { result });
+      console.log(`[worker] Job ${job.id} done:`, result?.message || result?.details || result?.actionTaken || result?.note || "ok");
     } catch (e) {
-      logFetchError("job-poll", e);
-      console.log(`[main] Poll failed. Sleeping for ${POLL_INTERVAL_MS / 1000}s before retrying...`);
-    } finally {
-      if (browser) await browser.close();
+      logFetchError(`jobs/${job.id}/complete`, e);
+    }
+  } catch (e) {
+    console.error(`[worker] Job ${job.id} failed:`, e.message);
+    try {
+      await apiPost(`/jobs/${job.id}/fail`, { error: e.message, requeue: false, delayMs: 0 });
+    } catch (e2) {
+      logFetchError(`jobs/${job.id}/fail`, e2);
     }
   }
 }
 
-// Start the main loop
-pollForJobs().catch(e => {
-  console.error("Fatal error in main loop:", e);
-  process.exit(1);
-});
+async function mainLoop() {
+  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
+  if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
+
+  try {
+    const stats = await apiGet("/jobs/stats");
+    console.log("[worker] API OK. Stats:", stats?.counts || stats);
+  } catch (e) {
+    logFetchError("jobs/stats (startup)", e);
+  }
+
+  while (true) {
+    try { await processOne(); }
+    catch (e) { console.error("[worker] loop error:", e.message || e); }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+mainLoop().catch((e) => { console.error("[worker] fatal:", e); process.exitCode = 1; });

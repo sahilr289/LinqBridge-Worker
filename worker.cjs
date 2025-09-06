@@ -1,22 +1,25 @@
 // worker.cjs — LinqBridge Worker (two-tab, calm nav, 429/404 guard, proxy-ready)
 //
-// What this version does (per your asks):
-// 1) After login, TAB 1 (feed): wait ~10s, then scroll ~5s. No refresh loops.
-// 2) TAB 2 (profile): open once (mobile fallback only if needed), wait ~10s, then scrape, then connect.
-// 3) Scraping expands "See more" where present.
-// 4) Connect is tried directly and under "More".
-// 5) Upfront guard rejects /in/ACo… or /in/ACw… slugs (prevents 404 churn).
+// What this version does:
+// 1) After auth, TAB 1 (feed): wait ~10s, then scroll ~5s. No refresh loops.
+// 2) TAB 2 (profile): open once (mobile fallback only if needed), wait ~10s, then scrape, then connect/message.
+// 3) Scraping expands “See more” where present.
+// 4) Connect is tried directly and under “More”.
+// 5) Upfront guard rejects /in/ ACo/ACw slugs (prevents 404 churn).
 // 6) Post-nav 429/404/captcha detection bails cleanly and applies cooldown.
-// 7) Conservative throttling and longer nav timeouts for slower networks.
-// 8) Optional HTTPS proxy support (set PROXY_* envs). WebRTC UDP is disabled.
+// 7) Conservative throttling + longer nav timeouts.
+// 8) Optional HTTPS proxy support; WebRTC UDP disabled.
+// 9) Robust against stale/corrupt storageState.
+// 10) CI friendly (interactive login off by default via env).
 //
-// ENV you may want to tune:
+// ENV to tune:
+// API_BASE, WORKER_SHARED_SECRET
 // HEADLESS, SLOWMO_MS, SOFT_MODE
 // FEED_INITIAL_WAIT_MS, FEED_SCROLL_MS, PROFILE_INITIAL_WAIT_MS
 // NAV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS
 // MAX_ACTIONS_PER_HOUR, MIN_GAP_MS, COOLDOWN_AFTER_*
 // PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD
-// STORAGE_STATE_PATH, STATE_DIR, FORCE_RELOGIN, ALLOW_INTERACTIVE_LOGIN
+// STORAGE_STATE_PATH, STATE_DIR, FORCE_RELOGIN, ALLOW_INTERACTIVE_LOGIN, ENABLE_VIDEO
 
 const path = require("path");
 const fs = require("fs");
@@ -44,11 +47,11 @@ if (process.env.ENABLE_HEALTH === "true") {
 // =========================
 // Env & Config
 // =========================
-const API_BASE = process.env.API_BASE || "https://YOUR-BACKEND.example.com";
+const API_BASE = process.env.API_BASE || "";
 const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET || "";
 
 // Browser execution
-const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS || "false");
+const HEADLESS = (/^(true|1|yes)$/i).test(process.env.HEADLESS ?? "true"); // default true for CI
 const SLOWMO_MS = parseInt(process.env.SLOWMO_MS || (HEADLESS ? "0" : "50"), 10);
 const SOFT_MODE = (/^(true|1|yes)$/i).test(process.env.SOFT_MODE || "false");
 
@@ -65,10 +68,10 @@ const COOLDOWN_AFTER_FAIL_MS = parseInt(process.env.COOLDOWN_AFTER_FAIL_MS || "6
 const MICRO_DELAY_MIN_MS = parseInt(process.env.MICRO_DELAY_MIN_MS || "400", 10);
 const MICRO_DELAY_MAX_MS = parseInt(process.env.MICRO_DELAY_MAX_MS || "1200", 10);
 
-// Per your spec
-const FEED_INITIAL_WAIT_MS = parseInt(process.env.FEED_INITIAL_WAIT_MS || "10000", 10);      // ~10s
-const FEED_SCROLL_MS = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);                  // ~5s
-const PROFILE_INITIAL_WAIT_MS = parseInt(process.env.PROFILE_INITIAL_WAIT_MS || "10000", 10); // ~10s
+// Per spec
+const FEED_INITIAL_WAIT_MS = parseInt(process.env.FEED_INITIAL_WAIT_MS || "10000", 10);
+const FEED_SCROLL_MS = parseInt(process.env.FEED_SCROLL_MS || "5000", 10);
+const PROFILE_INITIAL_WAIT_MS = parseInt(process.env.PROFILE_INITIAL_WAIT_MS || "10000", 10);
 
 // Timeouts
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.DEFAULT_TIMEOUT_MS || "35000", 10);
@@ -81,10 +84,13 @@ const ALLOW_MOBILE_FALLBACK = (/^(true|1|yes)$/i).test(process.env.ALLOW_MOBILE_
 const DEFAULT_STATE_PATH = process.env.STORAGE_STATE_PATH || "/app/auth-state.json";
 const STATE_DIR = process.env.STATE_DIR || "/app/state";
 const FORCE_RELOGIN = (/^(true|1|yes)$/i).test(process.env.FORCE_RELOGIN || "false");
-const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "true");
+const ALLOW_INTERACTIVE_LOGIN = (/^(true|1|yes)$/i).test(process.env.ALLOW_INTERACTIVE_LOGIN || "false"); // default false for CI
 const INTERACTIVE_LOGIN_TIMEOUT_MS = parseInt(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS || "300000", 10); // 5 min
 
-// Proxy (optional; must support HTTPS CONNECT for LinkedIn)
+// Video (optional)
+const ENABLE_VIDEO = (/^(true|1|yes)$/i).test(process.env.ENABLE_VIDEO || "false");
+
+// Proxy (optional)
 const PROXY_SERVER = process.env.PROXY_SERVER || ""; // e.g. http://USER:PASS@HOST:PORT
 const PROXY_USERNAME = process.env.PROXY_USERNAME || "";
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
@@ -108,7 +114,10 @@ function logFetchError(where, err) {
   console.error(`[worker] ${where} fetch failed:`, code, err?.message || err);
 }
 
-function apiUrl(p) { return p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`; }
+function apiUrl(p) {
+  if (!API_BASE) throw new Error("API_BASE is not set");
+  return p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`;
+}
 
 async function apiGet(p) {
   const res = await fetch(apiUrl(p), {
@@ -216,41 +225,36 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
     ? userStatePath
     : (!FORCE_RELOGIN && fs.existsSync(DEFAULT_STATE_PATH) ? DEFAULT_STATE_PATH : undefined);
 
-  const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    locale: "en-US",
-    timezoneId: "America/Los_Angeles",
-    colorScheme: "light",
-    viewport: { width: vw, height: vh },
-    javaScriptEnabled: true,
-    recordVideo: { dir: "/tmp/pw-video" },
-    storageState: storageStateOpt,
-  });
+  let context;
+  try {
+    context = await browser.newContext({
+      // Keep UA consistent; let Playwright set client hints internally
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      locale: "en-US",
+      timezoneId: "America/Los_Angeles",
+      colorScheme: "light",
+      viewport: { width: vw, height: vh },
+      javaScriptEnabled: true,
+      recordVideo: ENABLE_VIDEO ? { dir: "/tmp/pw-video" } : undefined,
+      storageState: storageStateOpt,
+    });
+  } catch (e) {
+    console.warn("[auth] storageState invalid; retrying without it:", e?.message || e);
+    context = await browser.newContext({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      locale: "en-US",
+      timezoneId: "America/Los_Angeles",
+      colorScheme: "light",
+      viewport: { width: vw, height: vh },
+      javaScriptEnabled: true,
+      recordVideo: ENABLE_VIDEO ? { dir: "/tmp/pw-video" } : undefined,
+    });
+  }
 
   await context.setExtraHTTPHeaders({
     "accept-language": "en-US,en;q=0.9",
     "upgrade-insecure-requests": "1",
-    "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-mobile": "?0",
-    "referer": "https://www.google.com/"
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    try {
-      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
-      Object.defineProperty(navigator, "language", { get: () => "en-US" });
-      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-      Object.defineProperty(navigator, "userAgent", { get: () =>
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-      });
-      const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
-      if (originalQuery) {
-        navigator.permissions.query = (p) =>
-          p?.name === "notifications" ? Promise.resolve({ state: "denied" }) : originalQuery(p);
-      }
-    } catch {}
+    // omit sec-ch-ua* to avoid mismatch; omit referer too
   });
 
   const page = await context.newPage();
@@ -270,7 +274,9 @@ async function createBrowserContext({ cookieBundle, headless, userStatePath }) {
       cookies.push(...expandDomains({ name: "li_at", value: cookieBundle.li_at, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
     }
     if (cookieBundle.jsessionid) {
-      cookies.push(...expandDomains({ name: "JSESSIONID", value: `"${cookieBundle.jsessionid}"`, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
+      const jsVal = String(cookieBundle.jsessionid);
+      const jsWrapped = /^".*"$/.test(jsVal) ? jsVal : `"${jsVal}"`;
+      cookies.push(...expandDomains({ name: "JSESSIONID", value: jsWrapped, path: "/", httpOnly: true, secure: true, sameSite: "None" }));
     }
     if (cookieBundle.bcookie) {
       cookies.push(...expandDomains({ name: "bcookie", value: cookieBundle.bcookie, path: "/", httpOnly: false, secure: true, sameSite: "None" }));
@@ -329,9 +335,9 @@ async function isAuthWalledOrGuest(page) {
 async function ensureAuthenticated(context, page, userStatePath) {
   const before = await cookieDiag(context);
 
-  // Desktop feed
+  // Desktop feed (prefer networkidle here)
   try {
-    const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    const r = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
     const s = r ? r.status() : null;
     console.log(`[nav] ✓ feed-desktop: status=${s} final=${page.url()}`);
     if (s && s >= 200 && s < 400 && !(await isAuthWalledOrGuest(page))) {
@@ -381,9 +387,18 @@ function extractInSlug(u) {
   const m = String(u || "").match(/linkedin\.com\/in\/([^\/?#]+)/i);
   return m ? decodeURIComponent(m[1]) : null;
 }
-function looksLikeUrnSlug(slug) {
-  return /^AC[ow]/.test(String(slug || ""));
+function looksLikeUrnSlug(slug) { return /^AC[ow]/.test(String(slug || "")); }
+
+function toMobileInUrl(u) {
+  try {
+    const url = new URL(u);
+    if (!/linkedin\.com$/i.test(url.hostname)) return u;
+    if (!/\/in\//i.test(url.pathname)) return u; // only for public /in/ profiles
+    url.hostname = "m.linkedin.com";
+    return url.toString();
+  } catch { return u; }
 }
+
 async function detectHardScreen(page) {
   try {
     const url = page.url() || "";
@@ -400,7 +415,7 @@ async function detectHardScreen(page) {
 async function navigateProfileClean(page, rawUrl) {
   const tries = [rawUrl];
   if (ALLOW_MOBILE_FALLBACK && /linkedin\.com\/in\//i.test(rawUrl)) {
-    tries.push(rawUrl.replace("www.linkedin.com", "m.linkedin.com").replace("linkedin.com/in/", "m.linkedin.com/in/"));
+    tries.push(toMobileInUrl(rawUrl));
   }
   for (let i = 0; i < tries.length; i++) {
     const u = tries[i];
@@ -417,7 +432,6 @@ async function navigateProfileClean(page, rawUrl) {
         console.log(`[nav] ✓ profile: status=${status} final=${finalUrl}`);
         return { authed: true, status, usedUrl: u, finalUrl };
       }
-      // if first failed and we have fallback, loop; otherwise return
       if (i === tries.length - 1) {
         return { authed: false, status, usedUrl: u, finalUrl, error: "authwall_or_unknown" };
       }
@@ -575,7 +589,7 @@ async function openConnectDialog(page) {
       }
     } catch {}
   }
-  // Mobile fallback
+  // Mobile-style fallback
   try {
     const mobileConnect = page.locator('button:has-text("Connect"), a:has-text("Connect")');
     if (await mobileConnect.first().isVisible({ timeout: 1200 }).catch(() => false)) {
@@ -1129,7 +1143,8 @@ async function processOne() {
 }
 
 async function mainLoop() {
-  console.log(`[worker] starting. API_BASE=${API_BASE} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
+  console.log(`[worker] starting. API_BASE=${API_BASE || "(unset)"} Headless: ${HEADLESS} SlowMo: ${SLOWMO_MS}ms Soft mode: ${SOFT_MODE}`);
+  if (!API_BASE) console.error("[worker] ERROR: API_BASE is empty. Set it to your backend URL.");
   if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
 
   try {

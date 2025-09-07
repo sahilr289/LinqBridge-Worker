@@ -9,7 +9,7 @@
 // - InMail/Open Profile recognition
 // - Connect selection filtered (button-only, no anchors; no "View in Sales Navigator")
 // - Sends plain invites by default (no note) — FORCE_NO_NOTES default true
-// - Message flow only when truly 1st-degree
+// - Message flow only when truly 1st-degree (with composer fallback)
 // - Per-domain throttle + gentle pacing
 // - Optional HTTPS proxy
 // - Safer fetch import, Mac/Win-friendly keybinds (Mod)
@@ -546,7 +546,6 @@ async function openConnectDialog(page) {
         await handle.click({ timeout: 4000 });
         await microDelay();
 
-        // If menu button navigated (rare), guard.
         if (page.url() !== beforeUrl && /\/search\/results\/people/i.test(page.url())) {
           console.log("[guard] misclick → people search from More; going back");
           await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
@@ -568,7 +567,6 @@ async function openConnectDialog(page) {
               await item.click({ timeout: 4000 });
               await microDelay();
 
-              // Misclick recovery after menu item
               if (page.url() !== beforeMenuUrl && /\/search\/results\/people/i.test(page.url())) {
                 console.log("[guard] misclick → people search from menu; going back");
                 await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
@@ -600,7 +598,6 @@ async function openConnectDialog(page) {
       const cand = h.first();
       if (!(await cand.isVisible({ timeout: 1200 }).catch(() => false))) continue;
 
-      // Skip anchors entirely (belt & suspenders)
       const isAnchor = await cand.evaluate(el => el.tagName.toLowerCase() === "a").catch(()=>false);
       if (isAnchor) continue;
 
@@ -609,7 +606,6 @@ async function openConnectDialog(page) {
       await cand.click({ timeout: 4000 });
       await microDelay();
 
-      // Misclick recovery if it navigated to people search
       if (page.url() !== beforeUrl && /\/search\/results\/people/i.test(page.url())) {
         console.log("[guard] misclick → people search; going back");
         await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
@@ -710,33 +706,10 @@ async function sendConnectionRequest(page, note) {
   return { actionTaken: "failed_to_send", relationshipStatus: "not_connected", details: "Unable to send invite" };
 }
 
-// ---------- Message Flow (UPDATED to accept /messaging/* redirects) ----------
+// ---------- Message Flow (with connected-fallback) ----------
 async function openMessageDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
-
-  async function waitForComposerOrMessagingPage() {
-    const ok = await Promise.race([
-      page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-      page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-      page.locator('[data-test-conversation-compose]').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-      (async () => {
-        for (let i = 0; i < 10; i++) {
-          const url = page.url() || "";
-          if (/\/messaging\//i.test(url)) {
-            const seen = await Promise.race([
-              page.locator('.msg-form__contenteditable[contenteditable="true"]').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
-              page.locator('form.msg-form, [data-live-test-ghost-text], .msg-conversations-container').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
-            ]);
-            if (seen) return true;
-          }
-          await sleep(500);
-        }
-        return false;
-      })(),
-    ]);
-    return ok;
-  }
 
   const direct = [
     page.getByRole("button", { name: /^Message$/i }),
@@ -750,15 +723,13 @@ async function openMessageDialog(page) {
       const handle = h.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await sprout('open-message');
-        const before = page.url();
         await handle.click({ timeout: 4000 }); await microDelay();
-        const ready = await waitForComposerOrMessagingPage();
-        if (ready) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "primary" };
-        if (page.url() !== before && /\/search\/results\/people/i.test(page.url())) {
-          console.log("[guard] misclick → people search from Message; going back");
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
-          await microDelay();
-        }
+        const ready = await Promise.race([
+          page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+          page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+          page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+        ]);
+        if (ready) return { opened: true, via: "primary" };
       }
     } catch {}
   }
@@ -773,7 +744,6 @@ async function openMessageDialog(page) {
       const handle = m.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await sprout('open-more-msg');
-        const beforeMenu = page.url();
         await handle.click({ timeout: 4000 }); await microDelay();
         const menuMsg = [
           page.getByRole("menuitem", { name: /^Message$/i }).first(),
@@ -784,13 +754,12 @@ async function openMessageDialog(page) {
           if (await mi.isVisible({ timeout: 1200 }).catch(() => false)) {
             await sprout('click-message-menu');
             await mi.click({ timeout: 4000 }); await microDelay();
-            const ready = await waitForComposerOrMessagingPage();
-            if (ready) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "more_menu" };
-            if (page.url() !== beforeMenu && /\/search\/results\/people/i.test(page.url())) {
-              console.log("[guard] misclick → people search from menu; going back");
-              await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
-              await microDelay();
-            }
+            const ready = await Promise.race([
+              page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+              page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+              page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+            ]);
+            if (ready) return { opened: true, via: "more_menu" };
           }
         }
       }
@@ -803,25 +772,23 @@ async function openMessageDialog(page) {
     if (await mobileMsg.first().isVisible({ timeout: 1200 }).catch(() => false)) {
       await sprout('mobile-message');
       await mobileMsg.first().click({ timeout: 4000 }); await microDelay();
-      const ok = await Promise.race([
+      const ready = await Promise.race([
         page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
         page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
         page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-        (async () => /\/messaging\//i.test(page.url()))(),
       ]);
-      if (ok) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "mobile_primary" };
+      if (ready) return { opened: true, via: "mobile_primary" };
     }
   } catch {}
 
   return { opened: false };
 }
-
 async function typeIntoComposer(page, text) {
   const limited = String(text).slice(0, 3000);
   const editors = [
     page.locator('.msg-form__contenteditable[contenteditable="true"]'),
     page.locator('[role="textbox"][contenteditable="true"]'),
-    page.locator('div[contenteditable="true"][data-live-test-ghost-text]'), // robust on full messaging page
+    page.locator('div[contenteditable="true"]'),
     page.getByRole("textbox"),
     page.locator('textarea'),
   ];
@@ -886,16 +853,38 @@ async function clickSendInComposer(page) {
   return false;
 }
 async function sendMessageFlow(page, messageText) {
+  // First, infer relationship from profile UI
   const rs = await detectRelationshipStatus(page);
-  if (rs.status !== "connected") {
-    const paid = await looksLikeInMailOrOpenProfile(page);
-    if (paid) {
-      return { actionTaken: "unavailable", relationshipStatus: "not_connected", details: "Messaging requires InMail/Open Profile (not 1st-degree)" };
+
+  // If clearly connected, try directly
+  if (rs.status === "connected") {
+    const opened = await openMessageDialog(page);
+    if (!opened.opened) {
+      return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
     }
-    return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
+    await microDelay();
+    const typed = await typeIntoComposer(page, messageText);
+    if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Could not type into composer" };
+    await microDelay();
+    const sent = await clickSendInComposer(page);
+    if (sent) return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent" };
+    return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Failed to send message" };
   }
+
+  // Not clearly connected:
+  // Respect your rule: if it looks like InMail/Open Profile, don't attempt
+  const paid = await looksLikeInMailOrOpenProfile(page);
+  if (paid) {
+    return { actionTaken: "unavailable", relationshipStatus: "not_connected", details: "Messaging requires InMail/Open Profile (not 1st-degree)" };
+  }
+
+  // Fallback: some profiles hide the "1st" chip. Try opening the composer anyway.
   const opened = await openMessageDialog(page);
-  if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
+  if (!opened.opened) {
+    return { actionTaken: "unavailable", relationshipStatus: rs.status || "not_connected", details: "Message not available (no composer)" };
+  }
+
+  // Composer exists → treat as practically connected and attempt send
   await microDelay();
   const typed = await typeIntoComposer(page, messageText);
   if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Could not type into composer" };
@@ -1042,12 +1031,12 @@ async function handleSendConnection(job) {
 
 async function handleSendMessage(job) {
   const p = job?.payload || {};
-  const targetUrl = p.profileUrl || (p.publicIdentifier ? `https://www.linkedin.com/in/${encodeURIComponent(p.publicIdentifier)}/` : null);
-  if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
+  thetargetUrl = p.profileUrl || (p.publicIdentifier ? `https://www.linkedin.com/in/${encodeURIComponent(p.publicIdentifier)}/` : null);
+  if (!thetargetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
   const messageText = p.message;
   if (!messageText) throw new Error("payload.message required");
 
-  if (SOFT_MODE) { await throttle.reserve("linkedin.com", "SOFT send_message"); await microDelay(); throttle.success("linkedin.com"); return { mode: "soft", profileUrl: targetUrl, messageUsed: messageText, at: new Date().toISOString() }; }
+  if (SOFT_MODE) { await throttle.reserve("linkedin.com", "SOFT send_message"); await microDelay(); throttle.success("linkedin.com"); return { mode: "soft", profileUrl: thetargetUrl, messageUsed: messageText, at: new Date().toISOString() }; }
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
 
@@ -1063,20 +1052,20 @@ async function handleSendMessage(job) {
     if (!auth.ok) {
       await browser.close().catch(()=>{});
       throttle.failure("linkedin.com");
-      return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Not authenticated (authwall/guest)" };
+      return { mode: "real", profileUrl: thetargetUrl, actionTaken: "unavailable", details: "Not authenticated (authwall/guest)" };
     }
 
     await feedWarmup(feedPage);
 
     profilePage = await newPageInContext(context);
 
-    const nav = await navigateProfileClean(profilePage, targetUrl);
+    const nav = await navigateProfileClean(profilePage, thetargetUrl);
     if (!nav.authed) {
       const details = nav.error || "Authwall/404/429 on profile nav.";
       try { await profilePage.close().catch(()=>{}); } catch {}
       await browser.close().catch(()=>{});
       throttle.failure("linkedin.com");
-      return { mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
+      return { mode: "real", profileUrl: thetargetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
     }
 
     await waitFullLoad(profilePage, NAV_TIMEOUT_MS);
@@ -1091,7 +1080,7 @@ async function handleSendMessage(job) {
       try { await profilePage.close().catch(()=>{}); } catch {}
       await browser.close().catch(()=>{});
       throttle.failure("linkedin.com");
-      return { mode: "real", profileUrl: targetUrl, actionTaken: hard === "404" ? "page_not_found" : "rate_limited", details };
+      return { mode: "real", profileUrl: thetargetUrl, actionTaken: hard === "404" ? "page_not_found" : "rate_limited", details };
     }
 
     const outcome = await sendMessageFlow(profilePage, messageText);
@@ -1105,7 +1094,7 @@ async function handleSendMessage(job) {
 
     return {
       mode: "real",
-      profileUrl: targetUrl,
+      profileUrl: thetargetUrl,
       actionTaken: outcome.actionTaken,
       relationshipStatus: outcome.relationshipStatus || "unknown",
       details: outcome.details,

@@ -472,6 +472,9 @@ function toMobileProfileUrl(u) {
     return url.toString();
   } catch { return u; }
 }
+function isProfileUrl(u) {
+  try { return /https?:\/\/([^.]+\.)?linkedin\.com\/(m\/)?in\//i.test(u); } catch { return false; }
+}
 async function navigateProfileClean(page, rawUrl) {
   const primary = String(rawUrl).replace("linkedin.com//", "linkedin.com/");
   const mobile  = toMobileProfileUrl(primary);
@@ -484,6 +487,7 @@ async function navigateProfileClean(page, rawUrl) {
       const resp = await page.goto(u, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
       const status = resp ? resp.status() : null;
       const finalUrl = page.url();
+      console.log(`[nav] final after goto: ${finalUrl}`);
 
       const hard = await detectHardScreen(page);
       if (status === 429 || hard === "429") return { authed: false, status: 429, usedUrl: u, finalUrl, error: "rate_limited" };
@@ -502,19 +506,19 @@ async function navigateProfileClean(page, rawUrl) {
         const final2 = page.url();
         const hard2 = await detectHardScreen(page);
         const stillAuthwall = /\/authwall/i.test(final2);
-        if (!stillAuthwall && !hard2) {
+        if (!stillAuthwall && !hard2 && isProfileUrl(final2)) {
           return { authed: true, status: 200, usedUrl: u, finalUrl: final2 };
         }
         // try next variant
       } else {
         const authed = !(await isAuthWalledOrGuest(page));
-        if (authed && status && status >= 200 && status < 400 && !hard) {
+        if (authed && status && status >= 200 && status < 400 && !hard && isProfileUrl(finalUrl)) {
           return { authed: true, status, usedUrl: u, finalUrl };
         }
       }
 
       if (i === tries.length - 1) {
-        return { authed: false, status, usedUrl: u, finalUrl, error: isAuthwall ? "authwall" : "authwall_or_unknown" };
+        return { authed: false, status, usedUrl: u, finalUrl, error: isAuthwall ? "authwall" : (isProfileUrl(finalUrl) ? "authwall_or_unknown" : "not_profile") };
       }
     } catch (e) {
       const finalUrl = page.url();
@@ -907,10 +911,20 @@ async function handleSendConnection(job) {
     const nav = await navigateProfileClean(profilePage, targetUrl);
     if (!nav.authed) {
       const details = nav.error || "Authwall/404/429 on profile nav.";
+      console.log(`[nav] failed. finalUrl=${nav.finalUrl} error=${details}`);
       try { await profilePage.close().catch(()=>{}); } catch {}
       await browser.close().catch(()=>{});
       throttle.failure("linkedin.com");
       return { mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
+    }
+
+    // extra guard: ensure we're actually on a profile page, not feed
+    if (!isProfileUrl(profilePage.url())) {
+      console.log(`[nav] landed on non-profile page (${profilePage.url()}). Aborting SEND_CONNECTION.`);
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(()=>{});
+      throttle.failure("linkedin.com");
+      return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Landed on non-profile page (redirected to feed)." };
     }
 
     // 5) brief profile scroll (~2s) then try connect
@@ -931,6 +945,15 @@ async function handleSendConnection(job) {
 
     // 6) send connection WITHOUT note
     const outcome = await sendConnectionRequest(profilePage, null);
+
+    // if somehow invite flow failed and page was not a profile anymore, fail fast
+    if (!isProfileUrl(profilePage.url())) {
+      console.log(`[guard] non-profile after attempt: ${profilePage.url()}`);
+      try { await profilePage.close().catch(()=>{}); } catch {}
+      await browser.close().catch(()=>{});
+      throttle.failure("linkedin.com");
+      return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Redirected off profile during attempt." };
+    }
 
     // 7) linger 3s
     await sleep(3000);

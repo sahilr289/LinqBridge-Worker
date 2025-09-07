@@ -6,10 +6,10 @@
 // - Authwall recovery (login nudge + retry)
 // - Mobile-first profile hop (env flag, fixed URL builder)
 // - Degree-aware relationship detection (1st/2nd/3rd)
-// - InMail/Open Profile recognition
+// - InMail/Open Profile recognition (fixed to not interfere with Connect)
 // - Connect selection filtered (button-only, no anchors; no "View in Sales Navigator")
 // - Sends plain invites by default (no note) — FORCE_NO_NOTES default true
-// - Message flow only when truly 1st-degree
+// - Message flow only when truly 1st-degree (supports aria-label="Message <Name>")
 // - Per-domain throttle + gentle pacing
 // - Optional HTTPS proxy
 // - Safer fetch import, Mac/Win-friendly keybinds (Mod)
@@ -90,212 +90,46 @@ const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 const within = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
-
 async function microDelay() { await sleep(within(MICRO_DELAY_MIN_MS, MICRO_DELAY_MAX_MS)); }
-
-async function sprout(label = "") {
-  const n = within(1, 3);
-  for (let i = 0; i < n; i++) await microDelay();
-  if (label) console.log(`[sprout] ${label} x${n}`);
-}
-
+async function sprout(label = "") { const n = within(1, 3); for (let i = 0; i < n; i++) await microDelay(); if (label) console.log(`[sprout] ${label} x${n}`); }
 const sanitizeUserId = (s) => String(s || "default").toLowerCase().replace(/[^a-z0-9]+/g, "_");
 const statePathForUser = (userId) => path.join(STATE_DIR, `${sanitizeUserId(userId)}.json`);
-
-function logFetchError(where, err) {
-  const code = err?.cause?.code || err?.code || "unknown";
-  console.error("[worker]", `${where} fetch failed:`, code, err?.message || err);
-}
-
+function logFetchError(where, err) { const code = err?.cause?.code || err?.code || "unknown"; console.error("[worker]", `${where} fetch failed:`, code, err?.message || err); }
 function apiUrl(p) { return p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`; }
-
-async function apiGet(p) {
-  const fetch = await getFetch();
-  const res = await fetch(apiUrl(p), {
-    method: "GET",
-    headers: { "x-worker-secret": WORKER_SHARED_SECRET },
-    signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
-  });
-  const text = await res.text();
-  try {
-    const json = JSON.parse(text);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-    return json;
-  } catch {
-    throw new Error(`GET ${p} non-JSON or error ${res.status}: ${text}`);
-  }
-}
-
-async function apiPost(p, body) {
-  const fetch = await getFetch();
-  const res = await fetch(apiUrl(p), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SHARED_SECRET },
-    body: JSON.stringify(body || {}),
-    signal: AbortSignal.timeout ? AbortSignal.timeout(25000) : undefined,
-  });
-  const text = await res.text();
-  try {
-    const json = JSON.parse(text);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-    return json;
-  } catch {
-    throw new Error(`POST ${p} non-JSON or error ${res.status}: ${text}`);
-  }
-}
-
-async function anyVisible(...locs) {
-  const checks = await Promise.all(locs.map((l) => l.first().isVisible({ timeout: 800 }).catch(() => false)));
-  return checks.some(Boolean);
-}
-
-async function waitFullLoad(page, timeout = 45000) {
-  await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => {});
-  try {
-    await Promise.race([ page.waitForLoadState("networkidle", { timeout: Math.min(timeout, 12000) }), sleep(6000) ]);
-  } catch {}
-}
-
-async function slowHumanScroll(page, totalMs = 6000) {
-  const start = Date.now(); let y = 0;
-  while (Date.now() - start < totalMs) {
-    const step = within(20, 55); y += step;
-    try { await page.mouse.wheel(0, step); } catch {}
-    await sleep(within(140, 260));
-  }
-  await sleep(within(400, 900));
-}
-
-async function briefProfileScroll(page, totalMs = 2000) {
-  const start = Date.now();
-  while (Date.now() - start < totalMs) {
-    try { await page.mouse.wheel(0, within(80, 140)); } catch {}
-    await sleep(within(120, 220));
-  }
-}
-
+async function apiGet(p) { const fetch = await getFetch(); const res = await fetch(apiUrl(p), { method: "GET", headers: { "x-worker-secret": WORKER_SHARED_SECRET }, signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined, }); const text = await res.text(); try { const json = JSON.parse(text); if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`); return json; } catch { throw new Error(`GET ${p} non-JSON or error ${res.status}: ${text}`); } }
+async function apiPost(p, body) { const fetch = await getFetch(); const res = await fetch(apiUrl(p), { method: "POST", headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SHARED_SECRET }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout ? AbortSignal.timeout(25000) : undefined, }); const text = await res.text(); try { const json = JSON.parse(text); if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`); return json; } catch { throw new Error(`POST ${p} non-JSON or error ${res.status}: ${text}`); } }
+async function anyVisible(...locs) { const checks = await Promise.all(locs.map((l) => l.first().isVisible({ timeout: 800 }).catch(() => false))); return checks.some(Boolean); }
+async function waitFullLoad(page, timeout = 45000) { await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => {}); try { await Promise.race([ page.waitForLoadState("networkidle", { timeout: Math.min(timeout, 12000) }), sleep(6000) ]); } catch {} }
+async function slowHumanScroll(page, totalMs = 6000) { const start = Date.now(); let y = 0; while (Date.now() - start < totalMs) { const step = within(20, 55); y += step; try { await page.mouse.wheel(0, step); } catch {} await sleep(within(140, 260)); } await sleep(within(400, 900)); }
+async function briefProfileScroll(page, totalMs = 2000) { const start = Date.now(); while (Date.now() - start < totalMs) { try { await page.mouse.wheel(0, within(80, 140)); } catch {} await sleep(within(120, 220)); } }
 function looksLikeAuthRedirect(url) { return /\/uas\/login/i.test(url) || /\/checkpoint\//i.test(url); }
-
-async function isAuthWalledOrGuest(page) {
-  try {
-    const url = page.url() || "";
-    if (looksLikeAuthRedirect(url)) return true;
-    const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
-    if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true;
-    const hasLogin = await page.locator('a[href*="login"]').first().isVisible({ timeout: 600 }).catch(() => false);
-    return !!hasLogin;
-  } catch { return false; }
-}
-
-async function detectHardScreen(page) {
-  try {
-    const url = page.url() || "";
-    const title = (await page.title().catch(() => "")) || "";
-    const bodyText = await page.locator("body").innerText().catch(() => "");
-    if (url.includes("/404") || /page not found/i.test(title) || /page not found/i.test(bodyText)) return "404";
-    if (/429/.test(title) || /too many requests/i.test(bodyText) || /temporarily blocked/i.test(bodyText)) return "429";
-    if (/captcha/i.test(title) || /verify/i.test(bodyText)) return "captcha";
-  } catch {}
-  return null;
-}
+async function isAuthWalledOrGuest(page) { try { const url = page.url() || ""; if (looksLikeAuthRedirect(url)) return true; const title = (await page.title().catch(() => ""))?.toLowerCase?.() || ""; if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true; const hasLogin = await page.locator('a[href*="login"]').first().isVisible({ timeout: 600 }).catch(() => false); return !!hasLogin; } catch { return false; } }
+async function detectHardScreen(page) { try { const url = page.url() || ""; const title = (await page.title().catch(() => "")) || ""; const bodyText = await page.locator("body").innerText().catch(() => ""); if (url.includes("/404") || /page not found/i.test(title) || /page not found/i.test(bodyText)) return "404"; if (/429/.test(title) || /too many requests/i.test(bodyText) || /temporarily blocked/i.test(bodyText)) return "429"; if (/captcha/i.test(title) || /verify/i.test(bodyText)) return "captcha"; } catch {} return null; }
 
 // ---------- Per-domain throttle ----------
-class DomainThrottle {
-  constructor() { this.state = new Map(); }
-  _get(domain) {
-    if (!this.state.has(domain)) this.state.set(domain, { lastActionAt: 0, events: [], cooldownUntil: 0 });
-    return this.state.get(domain);
-  }
-  _pruneOld(events) {
-    const cutoff = now() - 3600_000;
-    while (events.length && events[0] < cutoff) events.shift();
-  }
-  async reserve(domain, label = "action") {
-    const st = this._get(domain);
-    while (true) {
-      this._pruneOld(st.events);
-      const nowTs = now(); const waits = [];
-      if (st.cooldownUntil && st.cooldownUntil > nowTs) waits.push(st.cooldownUntil - nowTs);
-      if (st.events.length >= MAX_ACTIONS_PER_HOUR) waits.push(st.events[0] + 3600_000 - nowTs);
-      const sinceLast = nowTs - (st.lastActionAt || 0);
-      if (sinceLast < MIN_GAP_MS) waits.push(MIN_GAP_MS - sinceLast);
-      if (waits.length) {
-        const waitMs = Math.max(...waits) + within(1500, 3500);
-        console.log(`[throttle] Waiting ${Math.ceil(waitMs/1000)}s before ${label} (used: ${st.events.length}/${MAX_ACTIONS_PER_HOUR})`);
-        await sleep(waitMs);
-        continue;
-      }
-      st.lastActionAt = nowTs;
-      st.events.push(nowTs);
-      console.log(`[throttle] Reserved slot for ${label}. Used this hour: ${st.events.length}/${MAX_ACTIONS_PER_HOUR}`);
-      return;
-    }
-  }
-  success(domain) { const st = this._get(domain); st.cooldownUntil = Math.max(st.cooldownUntil, now() + COOLDOWN_AFTER_SENT_MS); }
-  failure(domain) { const st = this._get(domain); st.cooldownUntil = Math.max(st.cooldownUntil, now() + COOLDOWN_AFTER_FAIL_MS); }
-}
+class DomainThrottle { constructor() { this.state = new Map(); } _get(domain) { if (!this.state.has(domain)) this.state.set(domain, { lastActionAt: 0, events: [], cooldownUntil: 0 }); return this.state.get(domain); } _pruneOld(events) { const cutoff = now() - 3600_000; while (events.length && events[0] < cutoff) events.shift(); } async reserve(domain, label = "action") { const st = this._get(domain); while (true) { this._pruneOld(st.events); const nowTs = now(); const waits = []; if (st.cooldownUntil && st.cooldownUntil > nowTs) waits.push(st.cooldownUntil - nowTs); if (st.events.length >= MAX_ACTIONS_PER_HOUR) waits.push(st.events[0] + 3600_000 - nowTs); const sinceLast = nowTs - (st.lastActionAt || 0); if (sinceLast < MIN_GAP_MS) waits.push(MIN_GAP_MS - sinceLast); if (waits.length) { const waitMs = Math.max(...waits) + within(1500, 3500); console.log(`[throttle] Waiting ${Math.ceil(waitMs/1000)}s before ${label} (used: ${st.events.length}/${MAX_ACTIONS_PER_HOUR})`); await sleep(waitMs); continue; } st.lastActionAt = nowTs; st.events.push(nowTs); console.log(`[throttle] Reserved slot for ${label}. Used this hour: ${st.events.length}/${MAX_ACTIONS_PER_HOUR}`); return; } } success(domain) { const st = this._get(domain); st.cooldownUntil = Math.max(st.cooldownUntil, now() + COOLDOWN_AFTER_SENT_MS); } failure(domain) { const st = this._get(domain); st.cooldownUntil = Math.max(st.cooldownUntil, now() + COOLDOWN_AFTER_FAIL_MS); } }
 const throttle = new DomainThrottle();
 
 // ---------- Playwright boot ----------
 async function createBrowserContext({ headless, userStatePath }) {
   await fsp.mkdir(path.dirname(userStatePath || DEFAULT_STATE_PATH), { recursive: true }).catch(() => {});
-  const launchOpts = {
-    headless: !!headless,
-    slowMo: SLOWMO_MS,
-    args: [
-      "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--webrtc-stun-probe-trial=disabled",
-    ],
-  };
-  if (PROXY_SERVER) launchOpts.proxy = { server: PROXY_SERVER, username: PROXY_USERNAME || undefined, password: PROXY_PASSWORD || undefined };
+  const launchOpts = { headless: !!headless, slowMo: SLOWMO_MS, args: [ "--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-features=IsolateOrigins,site-per-process","--force-webrtc-ip-handling-policy=disable_non_proxied_udp","--webrtc-stun-probe-trial=disabled", ], };
+  if (PROXY_SERVER) { launchOpts.proxy = { server: PROXY_SERVER, username: PROXY_USERNAME || undefined, password: PROXY_PASSWORD || undefined }; }
   const browser = await chromium.launch(launchOpts);
   const vw = 1280 + Math.floor(Math.random() * 192);
   const vh = 720 + Math.floor(Math.random() * 160);
-  const storageStateOpt =
-    (!FORCE_RELOGIN && userStatePath && fs.existsSync(userStatePath)) ? userStatePath
-    : (!FORCE_RELOGIN && fs.existsSync(DEFAULT_STATE_PATH) ? DEFAULT_STATE_PATH : undefined);
-  const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    locale: "en-US", timezoneId: "America/Los_Angeles",
-    viewport: { width: vw, height: vh }, javaScriptEnabled: true,
-    recordVideo: { dir: "/tmp/pw-video" }, storageState: storageStateOpt,
-  });
-  await context.setExtraHTTPHeaders({
-    "accept-language":"en-US,en;q=0.9","upgrade-insecure-requests":"1",
-    "sec-ch-ua":'"Chromium";v="124", "Not:A-Brand";v="8"',
-    "sec-ch-ua-platform":'"Windows"',"sec-ch-ua-mobile":"?0", referer:"https://www.google.com/",
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    try {
-      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
-      Object.defineProperty(navigator, "language", { get: () => "en-US" });
-      Object.defineProperty(navigator, "languages", { get: () => ["en-US","en"] });
-      Object.defineProperty(navigator, "userAgent", { get: () =>
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" });
-    } catch {}
-  });
+  const storageStateOpt = (!FORCE_RELOGIN && userStatePath && fs.existsSync(userStatePath)) ? userStatePath : (!FORCE_RELOGIN && fs.existsSync(DEFAULT_STATE_PATH) ? DEFAULT_STATE_PATH : undefined);
+  const context = await browser.newContext({ userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", locale: "en-US", timezoneId: "America/Los_Angeles", viewport: { width: vw, height: vh }, javaScriptEnabled: true, recordVideo: { dir: "/tmp/pw-video" }, storageState: storageStateOpt, });
+  await context.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9", "upgrade-insecure-requests": "1", "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="8"', "sec-ch-ua-platform": '"Windows"', "sec-ch-ua-mobile": "?0", referer: "https://www.google.com/", });
+  await context.addInitScript(() => { Object.defineProperty(navigator, "webdriver", { get: () => false }); try { Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 }); Object.defineProperty(navigator, "language", { get: () => "en-US" }); Object.defineProperty(navigator, "languages", { get: () => ["en-US","en"] }); Object.defineProperty(navigator, "userAgent", { get: () => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" }); } catch {} });
   const page = await context.newPage();
   page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
   page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
   try { await page.bringToFront(); } catch {}
   return { browser, context, page };
 }
-
-async function newPageInContext(context) {
-  const p = await context.newPage();
-  p.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
-  p.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-  try { await p.bringToFront(); } catch {}
-  return p;
-}
-
-async function saveStorageState(context, outPath) {
-  try { await fsp.mkdir(path.dirname(outPath), { recursive: true }); await context.storageState({ path: outPath }); console.log("[auth] storageState saved to", outPath); }
-  catch (e) { console.log("[auth] storageState save failed:", e?.message || e); }
-}
+async function newPageInContext(context) { const p = await context.newPage(); p.setDefaultTimeout(DEFAULT_TIMEOUT_MS); p.setDefaultNavigationTimeout(NAV_TIMEOUT_MS); try { await p.bringToFront(); } catch {} return p; }
+async function saveStorageState(context, outPath) { try { await fsp.mkdir(path.dirname(outPath), { recursive: true }); await context.storageState({ path: outPath }); console.log("[auth] storageState saved to", outPath); } catch (e) { console.log("[auth] storageState save failed:", e?.message || e); } }
 
 // ---------- Feed warmup ----------
 async function feedWarmup(page) {
@@ -368,24 +202,38 @@ async function getConnectionDegree(page) {
   return null;
 }
 
+// UPDATED: broadened to match all "Message" variants (used by detector below)
 async function looksLikeInMailOrOpenProfile(page) {
   try {
     const hasMessage = await anyVisible(
-      page.getByRole("button", { name: /^Message$/i }),
-      page.getByRole("link", { name: /^Message$/i })
+      page.getByRole("button", { name: /(^|\s)Message(\s|$)/i }),
+      page.getByRole("link",   { name: /(^|\s)Message(\s|$)/i }),
+      page.locator('button[aria-label^="Message"]'),
+      page.locator('a[aria-label^="Message"]'),
+      page.locator('button:has(span.artdeco-button__text:has-text("Message"))'),
+      page.locator('a:has(span.artdeco-button__text:has-text("Message"))'),
+      page.locator('button[aria-label="Message"]'),
+      page.locator('a[data-control-name*="message"]'),
+      page.locator('button:has-text("Message")'),
     );
+
     const hasConnect = await anyVisible(
       page.getByRole("button", { name: /^Connect$/i }),
+      page.locator('button[aria-label="Connect"]'),
+      page.locator('button[data-control-name="connect"]'),
       page.locator('button:has-text("Connect")')
     );
+
     const inmailText = await page.getByText(/InMail/i).first().isVisible({ timeout: 600 }).catch(() => false);
-    const openText = await page.getByText(/Open Profile|Open to messages/i).first().isVisible({ timeout: 600 }).catch(() => false);
+    const openText   = await page.getByText(/Open Profile|Open to messages/i).first().isVisible({ timeout: 600 }).catch(() => false);
+
+    // If it's an InMail/Open Profile surface (and no Connect), this is NOT 1st-degree
     return (inmailText || openText) && !hasConnect && hasMessage;
   } catch {}
   return false;
 }
 
-// *** UPDATED: broader message detection for 1st-degree ***
+// UPDATED: preserve connect behavior; only treat Message as connected when safe
 async function detectRelationshipStatus(page) {
   // 1) Pending request?
   const pending = await anyVisible(
@@ -393,10 +241,20 @@ async function detectRelationshipStatus(page) {
   );
   if (pending) return { status: "pending", reason: "Pending/Requested visible" };
 
-  // 2) Degree badge (fast path)
+  // 2) Degree badge (fastest, most reliable)
   const degree = await getConnectionDegree(page);
+  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st"' };
 
-  // 3) Broad message/connect detection (handles aria-label="Message <Name>")
+  // 3) Connect button (authoritative for "not connected")
+  const connectVisible = await anyVisible(
+    page.getByRole("button", { name: /^Connect$/i }),
+    page.locator('button[aria-label="Connect"]'),
+    page.locator('button[data-control-name="connect"]'),
+    page.locator('button:has-text("Connect")')
+  );
+  if (connectVisible) return { status: "not_connected", reason: "Connect button visible" };
+
+  // 4) Message variants: only treat as connected if NOT InMail/Open Profile
   const messageVisible = await anyVisible(
     page.getByRole("button", { name: /(^|\s)Message(\s|$)/i }),
     page.getByRole("link",   { name: /(^|\s)Message(\s|$)/i }),
@@ -409,25 +267,13 @@ async function detectRelationshipStatus(page) {
     page.locator('button:has-text("Message")'),
   );
 
-  const connectVisible = await anyVisible(
-    page.getByRole("button", { name: /^Connect$/i }),
-    page.locator('button[aria-label="Connect"]'),
-    page.locator('button[data-control-name="connect"]'),
-    page.locator('button:has-text("Connect")')
-  );
-
-  // 4) Decide status
-  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st"' };
-
-  // If a real Message button is visible, treat as connected (guard against InMail/Open Profile)
   if (messageVisible) {
     const paid = await looksLikeInMailOrOpenProfile(page);
-    if (!paid) return { status: "connected", reason: "Message button visible (not InMail/Open Profile)" };
+    if (!paid) return { status: "connected", reason: 'Message button visible & not InMail/Open Profile' };
     return { status: "not_connected", reason: "Message is InMail/Open Profile (not 1st)" };
   }
 
-  if (connectVisible) return { status: "not_connected", reason: "Connect button visible" };
-
+  // 5) Maybe Connect is hidden under "More"
   const moreVisible = await anyVisible(
     page.getByRole("button", { name: /^More$/i }),
     page.getByRole("button", { name: /More actions/i }),
@@ -645,6 +491,7 @@ async function completeConnectDialog(page, note) {
   return { sent: false, withNote: false };
 }
 
+// ---------- Connection flow (UNCHANGED) ----------
 async function sendConnectionRequest(page, note) {
   const rs1 = await detectRelationshipStatus(page);
   if (rs1.status === "connected") return { actionTaken: "none", relationshipStatus: "connected", details: "Already 1st-degree" };
@@ -672,21 +519,14 @@ async function openMessageDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
 
-  // UPDATED: broaden "Message" selectors (supports aria-label="Message <Name>")
+  // broadened "Message" selectors (supports aria-label="Message <Name>")
   const direct = [
-    // role-based accessible name contains "Message" (covers "Message" and "Message Anshul")
     page.getByRole("button", { name: /(^|\s)Message(\s|$)/i }),
     page.getByRole("link",   { name: /(^|\s)Message(\s|$)/i }),
-
-    // aria-label variants
     page.locator('button[aria-label^="Message"]'),
     page.locator('a[aria-label^="Message"]'),
-
-    // visible label via artdeco text node
     page.locator('button:has(span.artdeco-button__text:has-text("Message"))'),
     page.locator('a:has(span.artdeco-button__text:has-text("Message"))'),
-
-    // legacy fallbacks
     page.locator('button[aria-label="Message"]'),
     page.locator('a[data-control-name*="message"]'),
     page.locator('button:has-text("Message")'),
@@ -722,7 +562,6 @@ async function openMessageDialog(page) {
         await sprout("open-more-msg");
         await handle.click({ timeout: 4000 });
         await microDelay();
-
         const menuMsg = [
           page.getByRole("menuitem", { name: /^Message$/i }).first(),
           page.locator('div[role="menuitem"]:has-text("Message")').first(),
@@ -824,7 +663,6 @@ async function clickSendInComposer(page) {
         sleep(1500).then(() => true),
       ]);
       if (sentByEnter) return true;
-
       await editor.press("Control+Enter").catch(() => {});
       await microDelay();
       const sentByCtrlEnter = await Promise.race([
@@ -905,6 +743,7 @@ async function handleSendConnection(job) {
     ({ browser, context, page: feedPage } = await createBrowserContext({ headless: HEADLESS, userStatePath }));
     video = feedPage.video?.();
 
+    // 1) auth on FEED
     const auth = await ensureAuthenticated(context, feedPage, userStatePath);
     if (!auth.ok) {
       await browser.close().catch(() => {});
@@ -912,28 +751,31 @@ async function handleSendConnection(job) {
       return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Not authenticated (authwall/guest)" };
     }
 
+    // 2) Warmup
     await feedWarmup(feedPage);
 
+    // 3) PROFILE tab
     profilePage = await newPageInContext(context);
 
+    // 4) Navigate to profile
     const nav = await navigateProfileClean(profilePage, targetUrl);
     if (!nav.authed) {
       const details = nav.error || "Authwall/404/429 on profile nav.";
-      console.log("[nav] failed.", `finalUrl=${nav.finalUrl}`, `error=${details}`);
       try { await profilePage.close().catch(() => {}); } catch {}
       await browser.close().catch(() => {});
       throttle.failure("linkedin.com");
       return { mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
     }
 
+    // extra guard
     if (!isProfileUrl(profilePage.url())) {
-      console.log("[nav] landed on non-profile page", `(${profilePage.url()}). Aborting SEND_CONNECTION.`);
       try { await profilePage.close().catch(() => {}); } catch {}
       await browser.close().catch(() => {});
       throttle.failure("linkedin.com");
       return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Landed on non-profile page (redirected to feed)." };
     }
 
+    // 5) brief scroll + wait
     await waitFullLoad(profilePage, NAV_TIMEOUT_MS);
     await briefProfileScroll(profilePage, 2000);
     await sleep(PROFILE_INITIAL_WAIT_MS);
@@ -947,11 +789,14 @@ async function handleSendConnection(job) {
       return { mode: "real", profileUrl: targetUrl, actionTaken: hard === "404" ? "page_not_found" : "rate_limited", details };
     }
 
+    // 6) send connection WITHOUT note  (UNCHANGED)
     const outcome = await sendConnectionRequest(profilePage, null);
 
+    // verify still on a profile
     if (!isProfileUrl(profilePage.url())) {
-      console.log("[guard] non-profile after attempt:", profilePage.url());
-      try { await profilePage.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {}); } catch {}
+      try {
+        await profilePage.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
+      } catch {}
       if (!isProfileUrl(profilePage.url())) {
         try { await profilePage.close().catch(() => {}); } catch {}
         await browser.close().catch(() => {});
@@ -960,6 +805,7 @@ async function handleSendConnection(job) {
       }
     }
 
+    // 7) linger a bit
     await sleep(3000);
     try { await profilePage.close().catch(() => {}); } catch {}
     await browser.close().catch(() => {});
@@ -1099,5 +945,4 @@ async function mainLoop() {
     await sleep(POLL_INTERVAL_MS);
   }
 }
-
 mainLoop().catch((e) => { console.error("[worker] fatal:", e); process.exitCode = 1; });

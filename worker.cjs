@@ -1,18 +1,19 @@
-// worker.cjs — LinqBridge Worker (FINAL robust, sequential)
+// worker.cjs — LinqBridge Worker (FINAL robust, sequential, misclick-guarded)
 //
-// What’s included:
+// What’s included (high-level):
 // - Strict single-thread flow: FEED → slow human scroll → then open PROFILE tab
 // - Auth & storageState per user (email)
 // - Authwall recovery (login nudge + retry)
 // - Mobile-first profile hop (env flag, fixed URL builder)
 // - Degree-aware relationship detection (1st/2nd/3rd)
 // - InMail/Open Profile recognition
-// - Connect selection filtered (no "View in Sales Navigator")
+// - Connect selection filtered (button-only, no anchors; no "View in Sales Navigator")
 // - Sends plain invites by default (no note) — FORCE_NO_NOTES default true
 // - Message flow only when truly 1st-degree
 // - Per-domain throttle + gentle pacing
 // - Optional HTTPS proxy
 // - Safer fetch import, Mac/Win-friendly keybinds (Mod)
+// - Misclick goBack recovery if a click navigates to people search
 //
 // ENV (tune as needed):
 // API_BASE=https://your-backend.example.com
@@ -52,7 +53,6 @@ let fetchRef = global.fetch;
 async function getFetch() {
   if (fetchRef) return fetchRef;
   try { fetchRef = (await import('node-fetch')).default; return fetchRef; } catch {}
-  // Fallback to cross-fetch CJS if present
   try { fetchRef = require('cross-fetch'); return fetchRef; } catch {}
   throw new Error('No fetch implementation available');
 }
@@ -98,13 +98,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 const within = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
 async function microDelay() { await sleep(within(MICRO_DELAY_MIN_MS, MICRO_DELAY_MAX_MS)); }
-
-// Sprout method: tiny human-like jitter before sensitive actions
-async function sprout(label = "") {
-  const n = within(1, 3);
-  for (let i = 0; i < n; i++) await microDelay();
-  if (label) console.log(`[sprout] ${label} x${n}`);
-}
+async function sprout(label = "") { const n = within(1, 3); for (let i = 0; i < n; i++) await microDelay(); if (label) console.log(`[sprout] ${label} x${n}`); }
 
 const sanitizeUserId = (s) => (String(s || "default").toLowerCase().replace(/[^a-z0-9]+/g, "_"));
 const statePathForUser = (userId) => path.join(STATE_DIR, `${sanitizeUserId(userId)}.json`);
@@ -149,7 +143,6 @@ async function apiPost(p, body) {
   }
 }
 
-// anyVisible helper to replace brittle Promise.any chains
 async function anyVisible(...locs) {
   const checks = await Promise.all(locs.map(l => l.first().isVisible({ timeout: 800 }).catch(() => false)));
   return checks.some(Boolean);
@@ -183,6 +176,31 @@ async function briefProfileScroll(page, totalMs = 2000) {
     try { await page.mouse.wheel(0, within(80, 140)); } catch {}
     await sleep(within(120, 220));
   }
+}
+
+function looksLikeAuthRedirect(url) {
+  return /\/uas\/login/i.test(url) || /\/checkpoint\//i.test(url);
+}
+async function isAuthWalledOrGuest(page) {
+  try {
+    const url = page.url() || "";
+    if (looksLikeAuthRedirect(url)) return true;
+    const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
+    if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true;
+    const hasLogin = await page.locator('a[href*="login"]').first().isVisible({ timeout: 600 }).catch(() => false);
+    return !!hasLogin;
+  } catch { return false; }
+}
+async function detectHardScreen(page) {
+  try {
+    const url = page.url() || "";
+    const title = (await page.title().catch(()=> "")) || "";
+    const bodyText = await page.locator("body").innerText().catch(()=>"");
+    if (url.includes("/404") || /page not found/i.test(title) || /page not found/i.test(bodyText)) return "404";
+    if (/429/.test(title) || /too many requests/i.test(bodyText) || /temporarily blocked/i.test(bodyText)) return "429";
+    if (/captcha/i.test(title) || /verify/i.test(bodyText)) return "captcha";
+  } catch {}
+  return null;
 }
 
 // ---------- Per-domain throttle ----------
@@ -254,7 +272,7 @@ async function createBrowserContext({ headless, userStatePath }) {
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "en-US",
-    timezoneId: "America/Los_Angeles", // consider making this per-user if accounts are India-based
+    timezoneId: "America/Los_Angeles",
     viewport: { width: vw, height: vh },
     javaScriptEnabled: true,
     recordVideo: { dir: "/tmp/pw-video" },
@@ -306,32 +324,7 @@ async function saveStorageState(context, outPath) {
   }
 }
 
-function looksLikeAuthRedirect(url) {
-  return /\/uas\/login/i.test(url) || /\/checkpoint\//i.test(url);
-}
-async function isAuthWalledOrGuest(page) {
-  try {
-    const url = page.url() || "";
-    if (looksLikeAuthRedirect(url)) return true;
-    const title = (await page.title().catch(() => ""))?.toLowerCase?.() || "";
-    if (title.includes("sign in") || title.includes("join linkedin") || title.includes("authwall")) return true;
-    const hasLogin = await page.locator('a[href*="login"]').first().isVisible({ timeout: 600 }).catch(() => false);
-    return !!hasLogin;
-  } catch { return false; }
-}
-async function detectHardScreen(page) {
-  try {
-    const url = page.url() || "";
-    const title = (await page.title().catch(()=> "")) || "";
-    const bodyText = await page.locator("body").innerText().catch(()=>"");
-    if (url.includes("/404") || /page not found/i.test(title) || /page not found/i.test(bodyText)) return "404";
-    if (/429/.test(title) || /too many requests/i.test(bodyText) || /temporarily blocked/i.test(bodyText)) return "429";
-    if (/captcha/i.test(title) || /verify/i.test(bodyText)) return "captcha";
-  } catch {}
-  return null;
-}
-
-// ---------- Feed warmup (full load + slow scroll, no actions) ----------
+// ---------- Feed warmup ----------
 async function feedWarmup(page) {
   try {
     if (!/linkedin\.com\/feed\/?$/i.test(page.url())) {
@@ -509,7 +502,6 @@ async function navigateProfileClean(page, rawUrl) {
         if (!stillAuthwall && !hard2 && isProfileUrl(final2)) {
           return { authed: true, status: 200, usedUrl: u, finalUrl: final2 };
         }
-        // try next variant
       } else {
         const authed = !(await isAuthWalledOrGuest(page));
         if (authed && status && status >= 200 && status < 400 && !hard && isProfileUrl(finalUrl)) {
@@ -534,37 +526,12 @@ async function navigateProfileClean(page, rawUrl) {
   return { authed: false, status: null, usedUrl: tries[0], finalUrl: page.url(), error: "unknown" };
 }
 
-// ---------- Open Connect (filtered vs Sales Navigator) ----------
+// ---------- Open Connect (button-only + misclick recovery) ----------
 async function openConnectDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
 
-  const direct = [
-    page.getByRole("button", { name: /^Connect$/i }),
-    page.getByRole("link",   { name: /^Connect$/i }),
-    page.locator('button[aria-label="Connect"]'),
-    page.locator('button[data-control-name="connect"]'),
-    page.locator('a[data-control-name="connect"]'),
-    // Exclude anything mentioning Sales Navigator via :not filters
-    page.locator('button:has-text("Connect"):not(:has-text("Sales Navigator")):not(:has-text("View in")):not(:has-text("Sales"))'),
-  ];
-  for (const h of direct) {
-    try {
-      const cand = h.first();
-      if (await cand.isVisible({ timeout: 1200 }).catch(() => false)) {
-        await sprout('connect-primary');
-        await cand.click({ timeout: 4000 });
-        await microDelay();
-        const ready = await Promise.race([
-          page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
-          page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
-          page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
-        ]);
-        if (ready) return { opened: true, via: "primary" };
-      }
-    } catch {}
-  }
-
+  // 1) Try "More → Connect" first (less likely to be confused with links)
   const more = [
     page.getByRole("button", { name: /^More$/i }),
     page.getByRole("button", { name: /More actions/i }),
@@ -575,8 +542,16 @@ async function openConnectDialog(page) {
       const handle = m.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await sprout('open-more');
+        const beforeUrl = page.url();
         await handle.click({ timeout: 4000 });
         await microDelay();
+
+        // If menu button navigated (rare), guard.
+        if (page.url() !== beforeUrl && /\/search\/results\/people/i.test(page.url())) {
+          console.log("[guard] misclick → people search from More; going back");
+          await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+          await microDelay();
+        }
 
         const candidates = [
           page.getByRole("menuitem", { name: /^Connect$/i }).first(),
@@ -589,8 +564,17 @@ async function openConnectDialog(page) {
               const t = (await item.innerText().catch(()=>"")).trim();
               if (/Sales\s*Navigator|View in Sales/i.test(t)) continue;
               await sprout('click-connect-menu');
+              const beforeMenuUrl = page.url();
               await item.click({ timeout: 4000 });
               await microDelay();
+
+              // Misclick recovery after menu item
+              if (page.url() !== beforeMenuUrl && /\/search\/results\/people/i.test(page.url())) {
+                console.log("[guard] misclick → people search from menu; going back");
+                await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+                await microDelay();
+              }
+
               const ready = await Promise.race([
                 page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
                 page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
@@ -604,14 +588,58 @@ async function openConnectDialog(page) {
     } catch {}
   }
 
-  // mobile fallback
-  try {
-    const mobileConnect = page.locator('button:has-text("Connect"), a:has-text("Connect")')
-      .filter({ hasText: /Connect/i });
-    if (await mobileConnect.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-      await sprout('mobile-connect');
-      await mobileConnect.first().click({ timeout: 4000 });
+  // 2) Try primary "Connect" button (button-only + exact text)
+  const direct = [
+    page.getByRole("button", { name: "Connect" }),
+    page.locator('button[aria-label="Connect"]'),
+    page.locator('button[data-control-name="connect"]'),
+    page.locator('button').filter({ hasText: /^\s*Connect\s*$/i }),
+  ];
+  for (const h of direct) {
+    try {
+      const cand = h.first();
+      if (!(await cand.isVisible({ timeout: 1200 }).catch(() => false))) continue;
+
+      // Skip anchors entirely (belt & suspenders)
+      const isAnchor = await cand.evaluate(el => el.tagName.toLowerCase() === "a").catch(()=>false);
+      if (isAnchor) continue;
+
+      await sprout('connect-primary');
+      const beforeUrl = page.url();
+      await cand.click({ timeout: 4000 });
       await microDelay();
+
+      // Misclick recovery if it navigated to people search
+      if (page.url() !== beforeUrl && /\/search\/results\/people/i.test(page.url())) {
+        console.log("[guard] misclick → people search; going back");
+        await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+        await microDelay();
+      }
+
+      const ready = await Promise.race([
+        page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
+        page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
+        page.getByRole("button", { name: /^Send$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
+      ]);
+      if (ready) return { opened: true, via: "primary" };
+    } catch {}
+  }
+
+  // 3) Mobile fallback: button-only, exact name
+  try {
+    const mobileConnect = page.getByRole("button", { name: "Connect" }).first();
+    if (await mobileConnect.isVisible({ timeout: 1200 }).catch(() => false)) {
+      await sprout('mobile-connect');
+      const beforeUrl = page.url();
+      await mobileConnect.click({ timeout: 4000 });
+      await microDelay();
+
+      if (page.url() !== beforeUrl && /\/search\/results\/people/i.test(page.url())) {
+        console.log("[guard] misclick → people search (mobile); going back");
+        await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+        await microDelay();
+      }
+
       const ready = await Promise.race([
         page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
         page.getByRole("button", { name: /^Add a note$/i }).waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
@@ -628,7 +656,6 @@ async function openConnectDialog(page) {
 async function completeConnectDialog(page, note) {
   const noteToUse = null; // force no notes
 
-  // Try direct send first
   const sendCandidates = [
     page.getByRole("button", { name: /^Send$/i }),
     page.locator('button[aria-label="Send now"]'),
@@ -683,7 +710,7 @@ async function sendConnectionRequest(page, note) {
   return { actionTaken: "failed_to_send", relationshipStatus: "not_connected", details: "Unable to send invite" };
 }
 
-// ---------- Message Flow (unchanged core, with Mod key) ----------
+// ---------- Message Flow ----------
 async function openMessageDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
@@ -901,7 +928,7 @@ async function handleSendConnection(job) {
       return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Not authenticated (authwall/guest)" };
     }
 
-    // 2) Full load + slow human scroll, then STOP
+    // 2) Full load + slow human scroll
     await feedWarmup(feedPage);
 
     // 3) Open PROFILE tab only now
@@ -946,16 +973,19 @@ async function handleSendConnection(job) {
     // 6) send connection WITHOUT note
     const outcome = await sendConnectionRequest(profilePage, null);
 
-    // if somehow invite flow failed and page was not a profile anymore, fail fast
+    // verify still on a profile
     if (!isProfileUrl(profilePage.url())) {
       console.log(`[guard] non-profile after attempt: ${profilePage.url()}`);
-      try { await profilePage.close().catch(()=>{}); } catch {}
-      await browser.close().catch(()=>{});
-      throttle.failure("linkedin.com");
-      return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Redirected off profile during attempt." };
+      try { await profilePage.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{}); } catch {}
+      if (!isProfileUrl(profilePage.url())) {
+        try { await profilePage.close().catch(()=>{}); } catch {}
+        await browser.close().catch(()=>{});
+        throttle.failure("linkedin.com");
+        return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Redirected off profile during attempt." };
+      }
     }
 
-    // 7) linger 3s
+    // 7) linger a bit
     await sleep(3000);
 
     try { await profilePage.close().catch(()=>{}); } catch {}

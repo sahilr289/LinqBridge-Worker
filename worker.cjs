@@ -395,14 +395,12 @@ async function getConnectionDegree(page) {
       page.getByText(/^2nd\b/i).first(),
       page.getByText(/^3rd\b/i).first(),
       page.locator('[data-test-connection-badge]').first(),
-      // NEW: fallback texts sometimes shown instead of the badge
-      page.getByText(/You(?:’|')re connected|Connected/i).first(),
     ];
     for (const l of cands) {
       const vis = await l.isVisible({ timeout: 800 }).catch(() => false);
       if (!vis) continue;
       const t = (await l.innerText().catch(()=>"")).trim();
-      if (/^1st\b/i.test(t) || /connected/i.test(t)) return "1st";
+      if (/^1st\b/i.test(t)) return "1st";
       if (/^2nd\b/i.test(t)) return "2nd";
       if (/^3rd\b/i.test(t)) return "3rd";
     }
@@ -441,7 +439,7 @@ async function detectRelationshipStatus(page) {
     page.locator('button:has-text("Connect")')
   );
 
-  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st" or Connected text' };
+  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st"' };
 
   if (messageBtn && !connectBtn) {
     const paid = await looksLikeInMailOrOpenProfile(page);
@@ -712,10 +710,33 @@ async function sendConnectionRequest(page, note) {
   return { actionTaken: "failed_to_send", relationshipStatus: "not_connected", details: "Unable to send invite" };
 }
 
-// ---------- Message Flow ----------
+// ---------- Message Flow (UPDATED to accept /messaging/* redirects) ----------
 async function openMessageDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
+
+  async function waitForComposerOrMessagingPage() {
+    const ok = await Promise.race([
+      page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+      page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+      page.locator('[data-test-conversation-compose]').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+      (async () => {
+        for (let i = 0; i < 10; i++) {
+          const url = page.url() || "";
+          if (/\/messaging\//i.test(url)) {
+            const seen = await Promise.race([
+              page.locator('.msg-form__contenteditable[contenteditable="true"]').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
+              page.locator('form.msg-form, [data-live-test-ghost-text], .msg-conversations-container').waitFor({ timeout: 1500 }).then(() => true).catch(() => false),
+            ]);
+            if (seen) return true;
+          }
+          await sleep(500);
+        }
+        return false;
+      })(),
+    ]);
+    return ok;
+  }
 
   const direct = [
     page.getByRole("button", { name: /^Message$/i }),
@@ -729,13 +750,15 @@ async function openMessageDialog(page) {
       const handle = h.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await sprout('open-message');
+        const before = page.url();
         await handle.click({ timeout: 4000 }); await microDelay();
-        const ready = await Promise.race([
-          page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-          page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-          page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-        ]);
-        if (ready) return { opened: true, via: "primary" };
+        const ready = await waitForComposerOrMessagingPage();
+        if (ready) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "primary" };
+        if (page.url() !== before && /\/search\/results\/people/i.test(page.url())) {
+          console.log("[guard] misclick → people search from Message; going back");
+          await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+          await microDelay();
+        }
       }
     } catch {}
   }
@@ -750,6 +773,7 @@ async function openMessageDialog(page) {
       const handle = m.first();
       if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
         await sprout('open-more-msg');
+        const beforeMenu = page.url();
         await handle.click({ timeout: 4000 }); await microDelay();
         const menuMsg = [
           page.getByRole("menuitem", { name: /^Message$/i }).first(),
@@ -760,12 +784,13 @@ async function openMessageDialog(page) {
           if (await mi.isVisible({ timeout: 1200 }).catch(() => false)) {
             await sprout('click-message-menu');
             await mi.click({ timeout: 4000 }); await microDelay();
-            const ready = await Promise.race([
-              page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-              page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-              page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
-            ]);
-            if (ready) return { opened: true, via: "more_menu" };
+            const ready = await waitForComposerOrMessagingPage();
+            if (ready) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "more_menu" };
+            if (page.url() !== beforeMenu && /\/search\/results\/people/i.test(page.url())) {
+              console.log("[guard] misclick → people search from menu; going back");
+              await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(()=>{});
+              await microDelay();
+            }
           }
         }
       }
@@ -778,23 +803,25 @@ async function openMessageDialog(page) {
     if (await mobileMsg.first().isVisible({ timeout: 1200 }).catch(() => false)) {
       await sprout('mobile-message');
       await mobileMsg.first().click({ timeout: 4000 }); await microDelay();
-      const ready = await Promise.race([
+      const ok = await Promise.race([
         page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
         page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
         page.locator('[data-test-conversation-compose], .msg-form__contenteditable').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
+        (async () => /\/messaging\//i.test(page.url()))(),
       ]);
-      if (ready) return { opened: true, via: "mobile_primary" };
+      if (ok) return { opened: true, via: /\/messaging\//i.test(page.url()) ? "messaging_page" : "mobile_primary" };
     }
   } catch {}
 
   return { opened: false };
 }
+
 async function typeIntoComposer(page, text) {
   const limited = String(text).slice(0, 3000);
   const editors = [
     page.locator('.msg-form__contenteditable[contenteditable="true"]'),
     page.locator('[role="textbox"][contenteditable="true"]'),
-    page.locator('div[contenteditable="true"]'),
+    page.locator('div[contenteditable="true"][data-live-test-ghost-text]'), // robust on full messaging page
     page.getByRole("textbox"),
     page.locator('textarea'),
   ];
@@ -858,22 +885,7 @@ async function clickSendInComposer(page) {
   } catch {}
   return false;
 }
-
-// *** ONLY CHANGED SECTION (message logic): try composer first, then fall back; never sends if not 1st-degree ***
 async function sendMessageFlow(page, messageText) {
-  // 1) Ground truth attempt: if we can open the composer, we can message (i.e., 1st-degree)
-  const openedPre = await openMessageDialog(page);
-  if (openedPre.opened) {
-    await microDelay();
-    const typed = await typeIntoComposer(page, messageText);
-    if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Composer open but could not type" };
-    await microDelay();
-    const sent = await clickSendInComposer(page);
-    if (sent) return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent (composer opened directly)" };
-    return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Composer open but failed to send" };
-  }
-
-  // 2) Badge/heuristics (kept): only proceed if truly connected
   const rs = await detectRelationshipStatus(page);
   if (rs.status !== "connected") {
     const paid = await looksLikeInMailOrOpenProfile(page);
@@ -882,8 +894,6 @@ async function sendMessageFlow(page, messageText) {
     }
     return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
   }
-
-  // 3) If heuristics say connected, try to open and send
   const opened = await openMessageDialog(page);
   if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
   await microDelay();

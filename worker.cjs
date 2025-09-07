@@ -395,12 +395,14 @@ async function getConnectionDegree(page) {
       page.getByText(/^2nd\b/i).first(),
       page.getByText(/^3rd\b/i).first(),
       page.locator('[data-test-connection-badge]').first(),
+      // NEW: fallback texts sometimes shown instead of the badge
+      page.getByText(/You(?:’|')re connected|Connected/i).first(),
     ];
     for (const l of cands) {
       const vis = await l.isVisible({ timeout: 800 }).catch(() => false);
       if (!vis) continue;
       const t = (await l.innerText().catch(()=>"")).trim();
-      if (/^1st\b/i.test(t)) return "1st";
+      if (/^1st\b/i.test(t) || /connected/i.test(t)) return "1st";
       if (/^2nd\b/i.test(t)) return "2nd";
       if (/^3rd\b/i.test(t)) return "3rd";
     }
@@ -439,7 +441,7 @@ async function detectRelationshipStatus(page) {
     page.locator('button:has-text("Connect")')
   );
 
-  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st"' };
+  if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st" or Connected text' };
 
   if (messageBtn && !connectBtn) {
     const paid = await looksLikeInMailOrOpenProfile(page);
@@ -856,7 +858,22 @@ async function clickSendInComposer(page) {
   } catch {}
   return false;
 }
+
+// *** ONLY CHANGED SECTION (message logic): try composer first, then fall back; never sends if not 1st-degree ***
 async function sendMessageFlow(page, messageText) {
+  // 1) Ground truth attempt: if we can open the composer, we can message (i.e., 1st-degree)
+  const openedPre = await openMessageDialog(page);
+  if (openedPre.opened) {
+    await microDelay();
+    const typed = await typeIntoComposer(page, messageText);
+    if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Composer open but could not type" };
+    await microDelay();
+    const sent = await clickSendInComposer(page);
+    if (sent) return { actionTaken: "sent", relationshipStatus: "connected", details: "Message sent (composer opened directly)" };
+    return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Composer open but failed to send" };
+  }
+
+  // 2) Badge/heuristics (kept): only proceed if truly connected
   const rs = await detectRelationshipStatus(page);
   if (rs.status !== "connected") {
     const paid = await looksLikeInMailOrOpenProfile(page);
@@ -865,6 +882,8 @@ async function sendMessageFlow(page, messageText) {
     }
     return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
   }
+
+  // 3) If heuristics say connected, try to open and send
   const opened = await openMessageDialog(page);
   if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
   await microDelay();

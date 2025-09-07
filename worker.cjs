@@ -1,16 +1,18 @@
-// worker.cjs — LinqBridge Worker (FINAL robust)
+// worker.cjs — LinqBridge Worker (FINAL robust, sequential)
 //
 // What’s included:
+// - Strict single-thread flow: FEED → slow human scroll → then open PROFILE tab
 // - Auth & storageState per user (email)
 // - Authwall recovery (login nudge + retry)
-// - Mobile-first profile hop (env flag)
+// - Mobile-first profile hop (env flag, fixed URL builder)
 // - Degree-aware relationship detection (1st/2nd/3rd)
 // - InMail/Open Profile recognition
 // - Connect selection filtered (no "View in Sales Navigator")
-// - Sends plain invites by default (no note) — can force via FORCE_NO_NOTES
+// - Sends plain invites by default (no note) — FORCE_NO_NOTES default true
 // - Message flow only when truly 1st-degree
 // - Per-domain throttle + gentle pacing
 // - Optional HTTPS proxy
+// - Safer fetch import, Mac/Win-friendly keybinds (Mod)
 //
 // ENV (tune as needed):
 // API_BASE=https://your-backend.example.com
@@ -23,13 +25,15 @@
 // MIN_GAP_MS=60000
 // COOLDOWN_AFTER_SENT_MS=90000
 // COOLDOWN_AFTER_FAIL_MS=600000
-// FEED_INITIAL_WAIT_MS=10000
-// FEED_SCROLL_MS=5000
-// PROFILE_INITIAL_WAIT_MS=10000
+// MICRO_DELAY_MIN_MS=400
+// MICRO_DELAY_MAX_MS=1200
+// FEED_INITIAL_WAIT_MS=0              (full-load wait is enforced separately)
+// FEED_SCROLL_MS=0                    (we still do a 3–6s slow scroll even if 0)
+// PROFILE_INITIAL_WAIT_MS=8000
 // DEFAULT_TIMEOUT_MS=35000
 // NAV_TIMEOUT_MS=45000
 // USE_PROFILE_MOBILE_FIRST=true|false
-// FORCE_NO_NOTES=true|false
+// FORCE_NO_NOTES=true|false           (default true)
 // STORAGE_STATE_PATH=/app/auth-state.json
 // STATE_DIR=/app/state
 // FORCE_RELOGIN=false
@@ -43,7 +47,15 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const { chromium } = require("playwright");
-const fetch = global.fetch || require("node-fetch");
+
+let fetchRef = global.fetch;
+async function getFetch() {
+  if (fetchRef) return fetchRef;
+  try { fetchRef = (await import('node-fetch')).default; return fetchRef; } catch {}
+  // Fallback to cross-fetch CJS if present
+  try { fetchRef = require('cross-fetch'); return fetchRef; } catch {}
+  throw new Error('No fetch implementation available');
+}
 
 // ---------- Config ----------
 const API_BASE = process.env.API_BASE || "http://localhost:8080";
@@ -87,6 +99,13 @@ const now = () => Date.now();
 const within = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
 async function microDelay() { await sleep(within(MICRO_DELAY_MIN_MS, MICRO_DELAY_MAX_MS)); }
 
+// Sprout method: tiny human-like jitter before sensitive actions
+async function sprout(label = "") {
+  const n = within(1, 3);
+  for (let i = 0; i < n; i++) await microDelay();
+  if (label) console.log(`[sprout] ${label} x${n}`);
+}
+
 const sanitizeUserId = (s) => (String(s || "default").toLowerCase().replace(/[^a-z0-9]+/g, "_"));
 const statePathForUser = (userId) => path.join(STATE_DIR, `${sanitizeUserId(userId)}.json`);
 
@@ -97,6 +116,7 @@ function logFetchError(where, err) {
 function apiUrl(p) { return p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`; }
 
 async function apiGet(p) {
+  const fetch = await getFetch();
   const res = await fetch(apiUrl(p), {
     method: "GET",
     headers: { "x-worker-secret": WORKER_SHARED_SECRET },
@@ -112,6 +132,7 @@ async function apiGet(p) {
   }
 }
 async function apiPost(p, body) {
+  const fetch = await getFetch();
   const res = await fetch(apiUrl(p), {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SHARED_SECRET },
@@ -128,9 +149,45 @@ async function apiPost(p, body) {
   }
 }
 
+// anyVisible helper to replace brittle Promise.any chains
+async function anyVisible(...locs) {
+  const checks = await Promise.all(locs.map(l => l.first().isVisible({ timeout: 800 }).catch(() => false)));
+  return checks.some(Boolean);
+}
+
+async function waitFullLoad(page, timeout = 45000) {
+  await page.waitForLoadState('domcontentloaded', { timeout }).catch(()=>{});
+  try {
+    await Promise.race([
+      page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 12000) }),
+      sleep(6000)
+    ]);
+  } catch {}
+}
+
+async function slowHumanScroll(page, totalMs = 6000) {
+  const start = Date.now();
+  let y = 0;
+  while (Date.now() - start < totalMs) {
+    const step = within(20, 55);
+    y += step;
+    try { await page.mouse.wheel(0, step); } catch {}
+    await sleep(within(140, 260));
+  }
+  await sleep(within(400, 900));
+}
+
+async function briefProfileScroll(page, totalMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < totalMs) {
+    try { await page.mouse.wheel(0, within(80, 140)); } catch {}
+    await sleep(within(120, 220));
+  }
+}
+
 // ---------- Per-domain throttle ----------
 class DomainThrottle {
-  constructor() { this.state = new Map(); } // domain -> { lastActionAt, events: number[], cooldownUntil }
+  constructor() { this.state = new Map(); }
   _get(domain) {
     if (!this.state.has(domain)) this.state.set(domain, { lastActionAt: 0, events: [], cooldownUntil: 0 });
     return this.state.get(domain);
@@ -197,7 +254,7 @@ async function createBrowserContext({ headless, userStatePath }) {
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "en-US",
-    timezoneId: "America/Los_Angeles",
+    timezoneId: "America/Los_Angeles", // consider making this per-user if accounts are India-based
     viewport: { width: vw, height: vh },
     javaScriptEnabled: true,
     recordVideo: { dir: "/tmp/pw-video" },
@@ -274,22 +331,21 @@ async function detectHardScreen(page) {
   return null;
 }
 
-// ---------- Feed warmup ----------
+// ---------- Feed warmup (full load + slow scroll, no actions) ----------
 async function feedWarmup(page) {
   try {
     if (!/linkedin\.com\/feed\/?$/i.test(page.url())) {
       console.log("[nav] → feed-desktop: https://www.linkedin.com/feed/");
       await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     }
-    if (FEED_INITIAL_WAIT_MS > 0 || FEED_SCROLL_MS > 0) {
-      console.log(`[feed] warmup: waiting ${FEED_INITIAL_WAIT_MS} ms, then scrolling ${FEED_SCROLL_MS} ms`);
+    if (FEED_INITIAL_WAIT_MS > 0) {
+      console.log(`[feed] initial wait ${FEED_INITIAL_WAIT_MS} ms`);
       await sleep(FEED_INITIAL_WAIT_MS);
-      const start = Date.now();
-      while (Date.now() - start < FEED_SCROLL_MS) {
-        try { await page.mouse.wheel(0, within(120, 320)); } catch {}
-        await sleep(within(120, 220));
-      }
     }
+    console.log("[feed] waiting full load…");
+    await waitFullLoad(page, NAV_TIMEOUT_MS);
+    console.log("[feed] slow human scroll…");
+    await slowHumanScroll(page, Math.max(3000, FEED_SCROLL_MS || 6000));
   } catch (e) {
     console.log("[feed] warmup error:", e?.message || e);
   }
@@ -298,7 +354,6 @@ async function feedWarmup(page) {
 // ---------- Auth ensure ----------
 async function ensureAuthenticated(context, page, userStatePath) {
   try {
-    // Try desktop feed
     const r1 = await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     const s1 = r1 ? r1.status() : null;
     console.log(`[nav] ✓ feed-desktop: status=${s1} final=${page.url()}`);
@@ -310,7 +365,6 @@ async function ensureAuthenticated(context, page, userStatePath) {
     console.log("[nav] feed-desktop error:", e?.message || e);
   }
 
-  // Mobile feed fallback
   try {
     const r2 = await page.goto("https://m.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     const s2 = r2 ? r2.status() : null;
@@ -323,7 +377,6 @@ async function ensureAuthenticated(context, page, userStatePath) {
     console.log("[nav] feed-mobile error:", e?.message || e);
   }
 
-  // Interactive login
   if (!ALLOW_INTERACTIVE_LOGIN) return { ok: false, reason: "guest_or_authwall", url: page.url() };
   try {
     console.log("[nav] → login: https://www.linkedin.com/login");
@@ -344,16 +397,16 @@ async function ensureAuthenticated(context, page, userStatePath) {
 // ---------- Relationship helpers ----------
 async function getConnectionDegree(page) {
   try {
-    const locs = [
-      page.locator('span:has-text("1st")').first(),
-      page.locator('span:has-text("2nd")').first(),
-      page.locator('span:has-text("3rd")').first(),
+    const cands = [
+      page.getByText(/^1st\b/i).first(),
+      page.getByText(/^2nd\b/i).first(),
+      page.getByText(/^3rd\b/i).first(),
       page.locator('[data-test-connection-badge]').first(),
     ];
-    for (const l of locs) {
+    for (const l of cands) {
       const vis = await l.isVisible({ timeout: 800 }).catch(() => false);
       if (!vis) continue;
-      const t = await l.innerText().catch(()=>"");
+      const t = (await l.innerText().catch(()=>"")).trim();
       if (/^1st\b/i.test(t)) return "1st";
       if (/^2nd\b/i.test(t)) return "2nd";
       if (/^3rd\b/i.test(t)) return "3rd";
@@ -363,27 +416,35 @@ async function getConnectionDegree(page) {
 }
 async function looksLikeInMailOrOpenProfile(page) {
   try {
-    const inmail = await page.locator('text=/InMail/i').first().isVisible({ timeout: 600 }).catch(() => false);
-    const open   = await page.locator('text=/Open Profile|Open to messages/i').first().isVisible({ timeout: 600 }).catch(() => false);
-    const hasConnect = await page.getByRole("button", { name: /^Connect$/i }).first().isVisible({ timeout: 600 }).catch(() => false);
-    return (inmail || open) && !hasConnect;
+    const hasMessage = await anyVisible(
+      page.getByRole("button", { name: /^Message$/i }),
+      page.getByRole("link",   { name: /^Message$/i })
+    );
+    const hasConnect = await anyVisible(
+      page.getByRole("button", { name: /^Connect$/i }),
+      page.locator('button:has-text("Connect")')
+    );
+    const inmailText = await page.getByText(/InMail/i).first().isVisible({ timeout: 600 }).catch(() => false);
+    const openText   = await page.getByText(/Open Profile|Open to messages/i).first().isVisible({ timeout: 600 }).catch(() => false);
+    return (inmailText || openText) && !hasConnect && hasMessage;
   } catch {}
   return false;
 }
 async function detectRelationshipStatus(page) {
-  const pending = await page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i })
-    .first().isVisible({ timeout: 800 }).catch(() => false);
+  const pending = await anyVisible(
+    page.getByRole("button", { name: /Pending|Requested|Withdraw|Pending invitation/i })
+  );
   if (pending) return { status: "pending", reason: "Pending/Requested visible" };
 
   const degree = await getConnectionDegree(page);
-  const messageBtn = await Promise.any([
-    page.getByRole("button", { name: /^Message$/i }).first().isVisible({ timeout: 800 }),
-    page.getByRole("link",   { name: /^Message$/i }).first().isVisible({ timeout: 800 })
-  ]).catch(() => false);
-  const connectBtn = await Promise.any([
-    page.getByRole("button", { name: /^Connect$/i }).first().isVisible({ timeout: 800 }),
-    page.locator('button:has-text("Connect")').first().isVisible({ timeout: 800 })
-  ]).catch(() => false);
+  const messageBtn = await anyVisible(
+    page.getByRole("button", { name: /^Message$/i }),
+    page.getByRole("link",   { name: /^Message$/i })
+  );
+  const connectBtn = await anyVisible(
+    page.getByRole("button", { name: /^Connect$/i }),
+    page.locator('button:has-text("Connect")')
+  );
 
   if (degree === "1st") return { status: "connected", reason: 'Degree badge "1st"' };
 
@@ -394,22 +455,26 @@ async function detectRelationshipStatus(page) {
   }
   if (connectBtn) return { status: "not_connected", reason: "Connect button visible" };
 
-  const moreVisible = await Promise.any([
-    page.getByRole("button", { name: /^More$/i }).first().isVisible({ timeout: 800 }),
-    page.getByRole("button", { name: /More actions/i }).first().isVisible({ timeout: 800 })
-  ]).catch(() => false);
-
+  const moreVisible = await anyVisible(
+    page.getByRole("button", { name: /^More$/i }),
+    page.getByRole("button", { name: /More actions/i })
+  );
   if (moreVisible) return { status: "not_connected", reason: "Connect may be under More" };
 
   return { status: "not_connected", reason: "Unable to confirm; will try menus" };
 }
 
 // ---------- Profile nav with authwall recovery ----------
+function toMobileProfileUrl(u) {
+  try {
+    const url = new URL(u);
+    url.hostname = "m.linkedin.com";
+    return url.toString();
+  } catch { return u; }
+}
 async function navigateProfileClean(page, rawUrl) {
-  const primary = rawUrl.replace("linkedin.com//", "linkedin.com/");
-  const mobile  = primary
-    .replace("www.linkedin.com", "m.linkedin.com")
-    .replace("linkedin.com/in/", "m.linkedin.com/in/");
+  const primary = String(rawUrl).replace("linkedin.com//", "linkedin.com/");
+  const mobile  = toMobileProfileUrl(primary);
   const tries = USE_PROFILE_MOBILE_FIRST ? [mobile, primary] : [primary, mobile];
 
   for (let i = 0; i < tries.length; i++) {
@@ -440,7 +505,7 @@ async function navigateProfileClean(page, rawUrl) {
         if (!stillAuthwall && !hard2) {
           return { authed: true, status: 200, usedUrl: u, finalUrl: final2 };
         }
-        // try next variant (desktop/mobile)
+        // try next variant
       } else {
         const authed = !(await isAuthWalledOrGuest(page));
         if (authed && status && status >= 200 && status < 400 && !hard) {
@@ -476,12 +541,15 @@ async function openConnectDialog(page) {
     page.locator('button[aria-label="Connect"]'),
     page.locator('button[data-control-name="connect"]'),
     page.locator('a[data-control-name="connect"]'),
-    page.locator('button:has-text("Connect")').filter({ hasNotText: /Sales Navigator|Sales|View in/i }),
+    // Exclude anything mentioning Sales Navigator via :not filters
+    page.locator('button:has-text("Connect"):not(:has-text("Sales Navigator")):not(:has-text("View in")):not(:has-text("Sales"))'),
   ];
   for (const h of direct) {
     try {
-      if (await h.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-        await h.first().click({ timeout: 4000 });
+      const cand = h.first();
+      if (await cand.isVisible({ timeout: 1200 }).catch(() => false)) {
+        await sprout('connect-primary');
+        await cand.click({ timeout: 4000 });
         await microDelay();
         const ready = await Promise.race([
           page.getByRole("dialog").waitFor({ timeout: 3500 }).then(() => true).catch(() => false),
@@ -500,28 +568,23 @@ async function openConnectDialog(page) {
   ];
   for (const m of more) {
     try {
-      if (await m.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-        await m.first().click({ timeout: 4000 });
+      const handle = m.first();
+      if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
+        await sprout('open-more');
+        await handle.click({ timeout: 4000 });
         await microDelay();
 
         const candidates = [
-          page.getByRole("menuitem", { name: /^Connect$/i }),
-          page.locator('div[role="menuitem"]').filter({ hasText: /^\s*Connect\s*$/i }),
-          page.locator('span,div').filter({ hasText: /^\s*Connect\s*$/i }).locator('xpath=ancestor-or-self::*[@role="menuitem"]')
+          page.getByRole("menuitem", { name: /^Connect$/i }).first(),
+          page.locator('div[role="menuitem"]').filter({ hasText: /^\s*Connect\s*$/i }).first(),
+          page.locator('span,div').filter({ hasText: /^\s*Connect\s*$/i }).locator('xpath=ancestor-or-self::*[@role="menuitem"]').first(),
         ];
-
-        const isBadLabel = async (el) => {
+        for (const item of candidates) {
           try {
-            const t = (await el.innerText()).trim();
-            return /Sales\s*Navigator|View in Sales/i.test(t);
-          } catch { return false; }
-        };
-
-        for (const group of candidates) {
-          try {
-            const item = group.first();
             if (await item.isVisible({ timeout: 1200 }).catch(() => false)) {
-              if (await isBadLabel(item)) continue;
+              const t = (await item.innerText().catch(()=>"")).trim();
+              if (/Sales\s*Navigator|View in Sales/i.test(t)) continue;
+              await sprout('click-connect-menu');
               await item.click({ timeout: 4000 });
               await microDelay();
               const ready = await Promise.race([
@@ -540,8 +603,9 @@ async function openConnectDialog(page) {
   // mobile fallback
   try {
     const mobileConnect = page.locator('button:has-text("Connect"), a:has-text("Connect")')
-      .filter({ hasNotText: /Sales Navigator|Sales|View in/i });
+      .filter({ hasText: /Connect/i });
     if (await mobileConnect.first().isVisible({ timeout: 1200 }).catch(() => false)) {
+      await sprout('mobile-connect');
       await mobileConnect.first().click({ timeout: 4000 });
       await microDelay();
       const ready = await Promise.race([
@@ -556,72 +620,42 @@ async function openConnectDialog(page) {
   return { opened: false };
 }
 
-// ---------- Complete Connect (note optional) ----------
+// ---------- Complete Connect (forced no note) ----------
 async function completeConnectDialog(page, note) {
-  // Add note only if provided and not forced-off
-  const noteToUse = FORCE_NO_NOTES ? null : (note || null);
+  const noteToUse = null; // force no notes
 
-  if (noteToUse) {
-    const addNoteCandidates = [
-      page.getByRole("button", { name: /^Add a note$/i }),
-      page.locator('button:has-text("Add a note")'),
-      page.locator('button[aria-label="Add a note"]'),
-    ];
-    for (const an of addNoteCandidates) {
-      try {
-        if (await an.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-          await an.first().click({ timeout: 4000 });
-          await microDelay(); break;
-        }
-      } catch {}
-    }
-    const limited = String(noteToUse).slice(0, 300);
-    const textareas = [
-      page.locator('textarea[name="message"]'),
-      page.locator('textarea#custom-message'),
-      page.locator('textarea'),
-      page.getByRole("textbox"),
-    ];
-    for (const ta of textareas) {
-      try {
-        if (await ta.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-          await ta.first().click({ timeout: 3000 }).catch(()=>{});
-          await ta.first().fill(limited, { timeout: 4000 });
-          await microDelay(); break;
-        }
-      } catch {}
-    }
-  }
-
-  // Send
+  // Try direct send first
   const sendCandidates = [
     page.getByRole("button", { name: /^Send$/i }),
-    page.locator('button:has-text("Send")'),
     page.locator('button[aria-label="Send now"]'),
+    page.locator('button:has-text("Send")'),
   ];
   for (const s of sendCandidates) {
     try {
-      if (await s.first().isVisible({ timeout: 1500 }).catch(() => false)) {
-        await s.first().click({ timeout: 4000 });
+      const handle = s.first();
+      if (await handle.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await sprout('send-invite');
+        await handle.click({ timeout: 4000 });
         await microDelay();
         const closed = await Promise.race([
           page.getByRole("dialog").waitFor({ state: "detached", timeout: 5000 }).then(() => true).catch(() => false),
           page.locator('div:has-text("Invitation sent")').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
         ]);
-        if (closed) return { sent: true, withNote: !!noteToUse };
+        if (closed) return { sent: true, withNote: false };
       }
     } catch {}
   }
   try {
-    const sendWithout = page.locator('button:has-text("Send without a note")');
-    if (await sendWithout.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-      await sendWithout.first().click({ timeout: 4000 });
+    const sendWithout = page.locator('button:has-text("Send without a note")').first();
+    if (await sendWithout.isVisible({ timeout: 1200 }).catch(() => false)) {
+      await sprout('send-without-note');
+      await sendWithout.click({ timeout: 4000 });
       await microDelay();
       const closed = await page.getByRole("dialog").waitFor({ state: "detached", timeout: 5000 }).then(() => true).catch(() => false);
       if (closed) return { sent: true, withNote: false };
     }
   } catch {}
-  return { sent: false, withNote: !!noteToUse };
+  return { sent: false, withNote: false };
 }
 
 async function sendConnectionRequest(page, note) {
@@ -630,14 +664,14 @@ async function sendConnectionRequest(page, note) {
   if (rs1.status === "pending")   return { actionTaken: "none", relationshipStatus: "pending",   details: "Invitation already pending" };
 
   let opened = await openConnectDialog(page);
-  if (!opened.opened && !opened) {
+  if (!opened.opened) {
     try { await page.mouse.wheel(0, within(600, 1000)); await sleep(within(600, 1000)); } catch {}
     opened = await openConnectDialog(page);
-    if (!opened.opened && !opened) return { actionTaken: "unavailable", relationshipStatus: "not_connected", details: "Connect button not found" };
+    if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "not_connected", details: "Connect button not found" };
   }
 
-  const completed = await completeConnectDialog(page, note);
-  if (completed.sent) return { actionTaken: completed.withNote ? "sent_with_note" : "sent_without_note", relationshipStatus: "pending", details: "Invitation sent" };
+  const completed = await completeConnectDialog(page, null);
+  if (completed.sent) return { actionTaken: "sent_without_note", relationshipStatus: "pending", details: "Invitation sent" };
 
   const rs2 = await detectRelationshipStatus(page);
   if (rs2.status === "pending")   return { actionTaken: "sent_maybe", relationshipStatus: "pending", details: "Pending after dialog" };
@@ -645,7 +679,7 @@ async function sendConnectionRequest(page, note) {
   return { actionTaken: "failed_to_send", relationshipStatus: "not_connected", details: "Unable to send invite" };
 }
 
-// ---------- Message Flow ----------
+// ---------- Message Flow (unchanged core, with Mod key) ----------
 async function openMessageDialog(page) {
   try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
   await microDelay();
@@ -659,8 +693,10 @@ async function openMessageDialog(page) {
   ];
   for (const h of direct) {
     try {
-      if (await h.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-        await h.first().click({ timeout: 4000 }); await microDelay();
+      const handle = h.first();
+      if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
+        await sprout('open-message');
+        await handle.click({ timeout: 4000 }); await microDelay();
         const ready = await Promise.race([
           page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
           page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
@@ -678,16 +714,19 @@ async function openMessageDialog(page) {
   ];
   for (const m of more) {
     try {
-      if (await m.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-        await m.first().click({ timeout: 4000 }); await microDelay();
+      const handle = m.first();
+      if (await handle.isVisible({ timeout: 1200 }).catch(() => false)) {
+        await sprout('open-more-msg');
+        await handle.click({ timeout: 4000 }); await microDelay();
         const menuMsg = [
-          page.getByRole("menuitem", { name: /^Message$/i }),
-          page.locator('div[role="menuitem"]:has-text("Message")'),
-          page.locator('span:has-text("Message")').locator('xpath=ancestor-or-self::*[@role="menuitem"]'),
+          page.getByRole("menuitem", { name: /^Message$/i }).first(),
+          page.locator('div[role="menuitem"]:has-text("Message")').first(),
+          page.locator('span:has-text("Message")').locator('xpath=ancestor-or-self::*[@role="menuitem"]').first(),
         ];
         for (const mi of menuMsg) {
-          if (await mi.first().isVisible({ timeout: 1200 }).catch(() => false)) {
-            await mi.first().click({ timeout: 4000 }); await microDelay();
+          if (await mi.isVisible({ timeout: 1200 }).catch(() => false)) {
+            await sprout('click-message-menu');
+            await mi.click({ timeout: 4000 }); await microDelay();
             const ready = await Promise.race([
               page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
               page.locator('.msg-overlay-conversation-bubble').waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
@@ -704,6 +743,7 @@ async function openMessageDialog(page) {
   try {
     const mobileMsg = page.locator('button:has-text("Message"), a:has-text("Message")');
     if (await mobileMsg.first().isVisible({ timeout: 1200 }).catch(() => false)) {
+      await sprout('mobile-message');
       await mobileMsg.first().click({ timeout: 4000 }); await microDelay();
       const ready = await Promise.race([
         page.getByRole("dialog").waitFor({ timeout: 5000 }).then(() => true).catch(() => false),
@@ -734,7 +774,7 @@ async function typeIntoComposer(page, text) {
         if (tag === "textarea" || tag === "input") {
           await handle.fill(limited, { timeout: 4000 });
         } else {
-          await handle.press("Control+A").catch(()=>{});
+          await handle.press("Mod+A").catch(()=>{});
           await handle.type(limited, { delay: within(5, 25) });
         }
         return true;
@@ -751,8 +791,10 @@ async function clickSendInComposer(page) {
   ];
   for (const s of candidates) {
     try {
-      if (await s.first().isVisible({ timeout: 1500 }).catch(() => false)) {
-        await s.first().click({ timeout: 4000 }); await microDelay();
+      const handle = s.first();
+      if (await handle.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await sprout('send-message');
+        await handle.click({ timeout: 4000 }); await microDelay();
         const sent = await Promise.race([
           page.locator('div:has-text("Message sent")').waitFor({ timeout: 4000 }).then(() => true).catch(() => false),
           page.locator('.msg-form__contenteditable[contenteditable="true"]').evaluate(el => (el.innerText || "").trim().length === 0).catch(() => false),
@@ -793,7 +835,7 @@ async function sendMessageFlow(page, messageText) {
     return { actionTaken: "unavailable", relationshipStatus: rs.status, details: "Message not available (not connected)" };
   }
   const opened = await openMessageDialog(page);
-  if (!opened.opened && !opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
+  if (!opened.opened) return { actionTaken: "unavailable", relationshipStatus: "connected", details: "Message dialog not found" };
   await microDelay();
   const typed = await typeIntoComposer(page, messageText);
   if (!typed) return { actionTaken: "failed_to_type", relationshipStatus: "connected", details: "Could not type into composer" };
@@ -841,13 +883,13 @@ async function handleSendConnection(job) {
 
   const userId = p.userId || "default";
   const userStatePath = statePathForUser(userId);
-  const note = p.note || null;
 
   let browser, context, feedPage, profilePage, video;
   try {
     ({ browser, context, page: feedPage } = await createBrowserContext({ headless: HEADLESS, userStatePath }));
     video = feedPage.video?.();
 
+    // 1) auth on FEED, single tab only
     const auth = await ensureAuthenticated(context, feedPage, userStatePath);
     if (!auth.ok) {
       await browser.close().catch(()=>{});
@@ -855,9 +897,13 @@ async function handleSendConnection(job) {
       return { mode: "real", profileUrl: targetUrl, actionTaken: "unavailable", details: "Not authenticated (authwall/guest)" };
     }
 
+    // 2) Full load + slow human scroll, then STOP
     await feedWarmup(feedPage);
+
+    // 3) Open PROFILE tab only now
     profilePage = await newPageInContext(context);
 
+    // 4) Navigate to profile
     const nav = await navigateProfileClean(profilePage, targetUrl);
     if (!nav.authed) {
       const details = nav.error || "Authwall/404/429 on profile nav.";
@@ -866,6 +912,10 @@ async function handleSendConnection(job) {
       throttle.failure("linkedin.com");
       return { mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
     }
+
+    // 5) brief profile scroll (~2s) then try connect
+    await waitFullLoad(profilePage, NAV_TIMEOUT_MS);
+    await briefProfileScroll(profilePage, 2000);
 
     await sleep(PROFILE_INITIAL_WAIT_MS);
     const hard = await detectHardScreen(profilePage);
@@ -879,8 +929,12 @@ async function handleSendConnection(job) {
       return { mode: "real", profileUrl: targetUrl, actionTaken: hard === "404" ? "page_not_found" : "rate_limited", details };
     }
 
-    const outcome = await sendConnectionRequest(profilePage, note);
-    await sleep(1500);
+    // 6) send connection WITHOUT note
+    const outcome = await sendConnectionRequest(profilePage, null);
+
+    // 7) linger 3s
+    await sleep(3000);
+
     try { await profilePage.close().catch(()=>{}); } catch {}
     await browser.close().catch(()=>{});
 
@@ -931,6 +985,7 @@ async function handleSendMessage(job) {
     }
 
     await feedWarmup(feedPage);
+
     profilePage = await newPageInContext(context);
 
     const nav = await navigateProfileClean(profilePage, targetUrl);
@@ -941,6 +996,9 @@ async function handleSendMessage(job) {
       throttle.failure("linkedin.com");
       return { mode: "real", profileUrl: targetUrl, usedUrl: nav.usedUrl, finalUrl: nav.finalUrl, httpStatus: nav.status, actionTaken: "unavailable", details };
     }
+
+    await waitFullLoad(profilePage, NAV_TIMEOUT_MS);
+    await briefProfileScroll(profilePage, 2000);
 
     await sleep(PROFILE_INITIAL_WAIT_MS);
     const hard = await detectHardScreen(profilePage);

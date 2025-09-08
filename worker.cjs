@@ -1,18 +1,22 @@
-// worker.cjs — LinqBridge Worker (FINAL: connect flow untouched, messaging robust)
+// worker.cjs — LinqBridge Worker (FINAL: connects & messaging kept intact; adds caps+window+acceptance-scan)
 //
-// What’s included (high-level):
-// - Strict single-thread flow: FEED → slow human scroll → then open PROFILE tab
-// - Auth & storageState per user (email)
-// - Authwall recovery (login nudge + retry)
-// - Mobile-first profile hop (env flag, fixed URL builder)
-// - Degree-aware relationship detection (1st/2nd/3rd)
-// - InMail/Open Profile recognition
-// - Connect selection filtered (button-only, no anchors; no "View in Sales Navigator")
-// - Sends plain invites by default (no note) — FORCE_NO_NOTES default true
-// - Messaging: proceeds if real Message button is visible & composer opens (even if 1st badge not found)
-// - Per-domain throttle + gentle pacing
-// - Optional HTTPS proxy
-// - Misclick goBack recovery if a click navigates to people search
+// ✅ Everything that was working stays working.
+// ➕ Additions (non-breaking):
+//   - Per-user daily caps (default 15 invites / 15 messages) with in-worker counters (IST-based) and gentle requeue
+//   - Active window (default 10:00–22:00 IST, Mon–Fri). Outside window, jobs are requeued until next window
+//   - Optional “rest after cap” sleep window (default 12h) before picking more jobs for that user
+//   - Backend metrics ping (/worker/metrics/incr) after successful send (best-effort; doesn’t block)
+//   - New job types: ACCEPTANCE_SCAN (bulk) and CHECK_CONNECTED (single) to check 1st-degree acceptance via profile visit
+//
+// Notes:
+//   * No changes to connect flow, throttling, or messaging selectors.
+//   * If ENFORCE_DAILY_CAPS=false, worker will not gate—still reports metrics.
+//   * Window & caps are environment-driven here to avoid JWT; backend counters are incremented for observability.
+//   * If multiple workers run, in-worker caps are per-process; backend still records usage centrally.
+//
+// -----------------------------
+// Existing code (unaltered core) + additive logic starts below
+// -----------------------------
 
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -65,6 +69,16 @@ const PROXY_SERVER = process.env.PROXY_SERVER || "";
 const PROXY_USERNAME = process.env.PROXY_USERNAME || "";
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
 
+// ---------- NEW: Window & Caps (env-driven; IST-based) ----------
+const ENFORCE_DAILY_CAPS = (/^(true|1|yes)$/i).test(process.env.ENFORCE_DAILY_CAPS || "true");
+const MAX_INVITES_PER_DAY   = parseInt(process.env.MAX_INVITES_PER_DAY   || "15", 10);
+const MAX_MESSAGES_PER_DAY  = parseInt(process.env.MAX_MESSAGES_PER_DAY  || "15", 10);
+const START_TIME_IST        = process.env.START_TIME_IST || "10:00"; // HH:MM
+const ACTIVE_WINDOW_HOURS   = parseInt(process.env.ACTIVE_WINDOW_HOURS || "12", 10);
+const ACTIVE_DAYS           = (process.env.ACTIVE_DAYS || "Mon,Tue,Wed,Thu,Fri").split(",").map(s=>s.trim());
+const REST_AFTER_CAP_HOURS  = parseInt(process.env.REST_AFTER_CAP_HOURS || "12", 10);
+const REQUEUE_OUTSIDE_WINDOW_MS = parseInt(process.env.REQUEUE_OUTSIDE_WINDOW_MS || String(30*60*1000), 10); // 30m default
+
 // ---------- Utils ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -95,6 +109,110 @@ async function apiPost(p, body) {
   catch { throw new Error(`POST ${p} non-JSON or error ${res.status}: ${text}`); }
 }
 
+// ---------- NEW: IST helpers, window & counters ----------
+const IST_OFFSET_MIN = 330; // +05:30
+function nowIST() {
+  const d = new Date();
+  const utcMs = d.getTime() + d.getTimezoneOffset()*60000;
+  return new Date(utcMs + IST_OFFSET_MIN*60000);
+}
+function istYMD(d = nowIST()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,"0");
+  const day = String(d.getDate()).padStart(2,"0");
+  return `${y}-${m}-${day}`;
+}
+function parseHHMM(hhmm = "10:00") {
+  const [h, m] = (hhmm||"10:00").split(":").map(x=>parseInt(x,10));
+  return {h: Number.isFinite(h)?h:10, m: Number.isFinite(m)?m:0};
+}
+const weekdayNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+function istWindowForToday() {
+  const now = nowIST();
+  const ymd = istYMD(now);
+  const {h,m} = parseHHMM(START_TIME_IST);
+  // Build Date in IST by backing out offset to UTC
+  const utcStartMs = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), h - Math.floor(IST_OFFSET_MIN/60), m - (IST_OFFSET_MIN%60));
+  const start = new Date(utcStartMs);
+  const end = new Date(start.getTime() + (ACTIVE_WINDOW_HOURS||12)*3600_000);
+  const isActive = now >= start && now <= end;
+  const wd = weekdayNames[now.getDay()];
+  const dayActive = ACTIVE_DAYS.includes(wd);
+  return { ymd, start, end, isActive, dayActive, nowIST: now };
+}
+function nextActiveStartFrom(nowObj) {
+  // Returns next IST Date when window opens again on an active day
+  const {h,m} = parseHHMM(START_TIME_IST);
+  let d = new Date(nowObj.nowIST.getTime());
+  for (let i=0;i<8;i++) {
+    const wd = weekdayNames[d.getDay()];
+    if (ACTIVE_DAYS.includes(wd)) {
+      const uStart = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), h - Math.floor(IST_OFFSET_MIN/60), m - (IST_OFFSET_MIN%60));
+      const candidate = new Date(uStart);
+      if (candidate > nowObj.nowIST) return candidate;
+    }
+    d = new Date(d.getTime() + 24*3600_000);
+  }
+  // Fallback: tomorrow same time
+  const tmr = new Date(nowObj.nowIST.getTime() + 24*3600_000);
+  const uStart = Date.UTC(tmr.getFullYear(), tmr.getMonth(), tmr.getDate(), h - Math.floor(IST_OFFSET_MIN/60), m - (IST_OFFSET_MIN%60));
+  return new Date(uStart);
+}
+
+// In-process counters per user/day (IST)
+const userDaily = new Map(); // userId -> { ymd, invites, messages, sleepUntilMs? }
+
+function getUserCounter(userId) {
+  const key = sanitizeUserId(userId || "default");
+  const today = istYMD();
+  let obj = userDaily.get(key);
+  if (!obj || obj.ymd !== today) {
+    obj = { ymd: today, invites: 0, messages: 0, sleepUntilMs: 0 };
+    userDaily.set(key, obj);
+  }
+  return obj;
+}
+async function postMetricIncrement(userId, kind, delta=1) {
+  try { await apiPost("/worker/metrics/incr", { userId, kind, delta }); } catch (e) { logFetchError("metrics/incr", e); }
+}
+
+// Gate by window + caps; return {ok, requeueMs, reason}
+function gateWindowAndCaps(userId, kind /* 'invite' | 'message' */) {
+  if (!ENFORCE_DAILY_CAPS) return { ok: true };
+
+  const wnd = istWindowForToday();
+  if (!wnd.dayActive) {
+    const next = nextActiveStartFrom(wnd);
+    const ms = Math.max(1000, next.getTime() - wnd.nowIST.getTime());
+    return { ok: false, requeueMs: ms, reason: "inactive_day" };
+  }
+  if (!wnd.isActive) {
+    const ms = wnd.nowIST < wnd.start ? (wnd.start.getTime() - wnd.nowIST.getTime()) : REQUEUE_OUTSIDE_WINDOW_MS;
+    return { ok: false, requeueMs: Math.max(1000, ms), reason: "outside_window" };
+  }
+
+  const ctr = getUserCounter(userId);
+  if (ctr.sleepUntilMs && Date.now() < ctr.sleepUntilMs) {
+    return { ok: false, requeueMs: Math.max(1000, ctr.sleepUntilMs - Date.now()), reason: "rest_after_cap" };
+  }
+
+  if (kind === "invite" && ctr.invites >= MAX_INVITES_PER_DAY) {
+    ctr.sleepUntilMs = Date.now() + REST_AFTER_CAP_HOURS*3600_000;
+    return { ok: false, requeueMs: Math.max(1000, ctr.sleepUntilMs - Date.now()), reason: "invites_cap_reached" };
+  }
+  if (kind === "message" && ctr.messages >= MAX_MESSAGES_PER_DAY) {
+    ctr.sleepUntilMs = Date.now() + REST_AFTER_CAP_HOURS*3600_000;
+    return { ok: false, requeueMs: Math.max(1000, ctr.sleepUntilMs - Date.now()), reason: "messages_cap_reached" };
+  }
+  return { ok: true };
+}
+function bumpCounter(userId, kind, by=1) {
+  const ctr = getUserCounter(userId);
+  if (kind === "invite") ctr.invites += by;
+  if (kind === "message") ctr.messages += by;
+}
+
+// ---------- Page helpers ----------
 async function anyVisible(...locs) {
   const checks = await Promise.all(locs.map(l => l.first().isVisible({ timeout: 800 }).catch(() => false)));
   return checks.some(Boolean);
@@ -793,6 +911,18 @@ async function sendMessageFlow(page, messageText) {
   return { actionTaken: "failed_to_send", relationshipStatus: "connected", details: "Failed to send message" };
 }
 
+// ---------- NEW: Acceptance scan helpers ----------
+async function checkConnectedStatus(page, profileUrl) {
+  const nav = await navigateProfileClean(page, profileUrl);
+  if (!nav.authed) {
+    return { ok: false, profileUrl, status: "nav_error", details: nav.error || "nav_failed", httpStatus: nav.status || null };
+  }
+  await waitFullLoad(page, NAV_TIMEOUT_MS);
+  await briefProfileScroll(page, 1200);
+  const rel = await detectRelationshipStatus(page);
+  return { ok: true, profileUrl, status: rel.status || "unknown", reason: rel.reason || null };
+}
+
 // ---------- Job handlers ----------
 async function handleAuthCheck(job) {
   const userId = job?.payload?.userId || "default";
@@ -822,16 +952,25 @@ async function handleSendConnection(job) {
   const p = job?.payload || {};
   const targetUrl = p.profileUrl || (p.publicIdentifier ? `https://www.linkedin.com/in/${encodeURIComponent(p.publicIdentifier)}/` : null);
   if (!targetUrl) throw new Error("payload.profileUrl or publicIdentifier required");
+  const userId = p.userId || "default";
+
+  // Window + caps gate
+  const gate = gateWindowAndCaps(userId, "invite");
+  if (!gate.ok) {
+    console.log(`[gate] Requeue SEND_CONNECTION for ${userId}: ${gate.reason} requeueMs=${gate.requeueMs}`);
+    throw { _softDefer: true, msg: `gate:${gate.reason}`, requeueMs: gate.requeueMs || REQUEUE_OUTSIDE_WINDOW_MS };
+  }
 
   if (SOFT_MODE) {
     await throttle.reserve("linkedin.com", "SOFT send_connection");
     await microDelay();
     throttle.success("linkedin.com");
-    return { mode: "soft", profileUrl: targetUrl, at: new Date().toISOString() };
+    bumpCounter(userId, "invite", 1);
+    postMetricIncrement(userId, "invite", 1);
+    return { mode: "soft", profileUrl: targetUrl, at: new Date().toISOString(), acceptanceCheckAfterHours: 24 };
   }
 
   await throttle.reserve("linkedin.com", "SEND_CONNECTION");
-  const userId = p.userId || "default";
   const userStatePath = statePathForUser(userId);
 
   let browser, context, feedPage, profilePage, video;
@@ -894,20 +1033,26 @@ async function handleSendConnection(job) {
     try { await profilePage.close().catch(()=>{}); } catch {}
     await browser.close().catch(()=>{});
 
-    if (outcome.actionTaken?.startsWith("sent")) throttle.success("linkedin.com");
-    else if (outcome.actionTaken === "failed_to_send" || outcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
-    else throttle.success("linkedin.com");
+    if (outcome.actionTaken?.startsWith("sent")) {
+      throttle.success("linkedin.com");
+      bumpCounter(userId, "invite", 1);
+      postMetricIncrement(userId, "invite", 1);
+    } else if (outcome.actionTaken === "failed_to_send" || outcome.actionTaken === "unavailable") {
+      throttle.failure("linkedin.com");
+    } else throttle.success("linkedin.com");
 
     return {
       mode: "real", profileUrl: targetUrl,
       actionTaken: outcome.actionTaken,
       relationshipStatus: outcome.relationshipStatus || "unknown",
       details: outcome.details, at: new Date().toISOString(),
+      acceptanceCheckAfterHours: 24
     };
   } catch (e) {
     try { await profilePage?.close()?.catch(()=>{}); } catch {}
     try { await browser?.close(); } catch {}
     throttle.failure("linkedin.com");
+    if (e && e._softDefer) throw e; // bubble up for requeue
     throw new Error(`SEND_CONNECTION failed: ${e.message}`);
   }
 }
@@ -920,15 +1065,25 @@ async function handleSendMessage(job) {
   const messageText = p.message;
   if (!messageText) throw new Error("payload.message required");
 
+  const userId = p.userId || "default";
+
+  // Window + caps gate
+  const gate = gateWindowAndCaps(userId, "message");
+  if (!gate.ok) {
+    console.log(`[gate] Requeue SEND_MESSAGE for ${userId}: ${gate.reason} requeueMs=${gate.requeueMs}`);
+    throw { _softDefer: true, msg: `gate:${gate.reason}`, requeueMs: gate.requeueMs || REQUEUE_OUTSIDE_WINDOW_MS };
+  }
+
   if (SOFT_MODE) {
     await throttle.reserve("linkedin.com", "SOFT send_message");
     await microDelay();
     throttle.success("linkedin.com");
+    bumpCounter(userId, "message", 1);
+    postMetricIncrement(userId, "message", 1);
     return { mode: "soft", profileUrl: targetUrl, messageUsed: messageText, at: new Date().toISOString() };
   }
 
   await throttle.reserve("linkedin.com", "SEND_MESSAGE");
-  const userId = p.userId || "default";
   const userStatePath = statePathForUser(userId);
 
   let browser, context, feedPage, profilePage, video;
@@ -974,9 +1129,13 @@ async function handleSendMessage(job) {
     try { await profilePage.close().catch(()=>{}); } catch {}
     await browser.close().catch(()=>{});
 
-    if (outcome.actionTaken === "sent") throttle.success("linkedin.com");
-    else if (outcome.actionTaken?.startsWith("failed") || outcome.actionTaken === "unavailable") throttle.failure("linkedin.com");
-    else throttle.success("linkedin.com");
+    if (outcome.actionTaken === "sent") {
+      throttle.success("linkedin.com");
+      bumpCounter(userId, "message", 1);
+      postMetricIncrement(userId, "message", 1);
+    } else if (outcome.actionTaken?.startsWith("failed") || outcome.actionTaken === "unavailable") {
+      throttle.failure("linkedin.com");
+    } else throttle.success("linkedin.com");
 
     return {
       mode: "real", profileUrl: targetUrl,
@@ -988,23 +1147,104 @@ async function handleSendMessage(job) {
     try { await profilePage?.close()?.catch(()=>{}); } catch {}
     try { await browser?.close(); } catch {}
     throttle.failure("linkedin.com");
+    if (e && e._softDefer) throw e; // bubble up to requeue
     throw new Error(`SEND_MESSAGE failed: ${e.message}`);
+  }
+}
+
+// ---------- NEW: Acceptance scan handlers ----------
+async function handleAcceptanceScan(job) {
+  const p = job?.payload || {};
+  const userId = p.userId || "default";
+  const profiles = Array.isArray(p.profiles) ? p.profiles.slice(0, 50) : null; // optional list
+  const windowHours = Number.isFinite(+p.windowHours) ? +p.windowHours : 72;
+
+  if (SOFT_MODE) {
+    return { mode: "soft", scanned: profiles ? profiles.length : 0, windowHours, at: new Date().toISOString() };
+  }
+
+  const userStatePath = statePathForUser(userId);
+  let browser, context, feedPage, checkPage;
+  try {
+    ({ browser, context, page: feedPage } = await createBrowserContext({ headless: HEADLESS, userStatePath }));
+    const auth = await ensureAuthenticated(context, feedPage, userStatePath);
+    if (!auth.ok) {
+      await browser.close().catch(()=>{});
+      return { ok: false, reason: "auth_failed" };
+    }
+    await feedWarmup(feedPage);
+    checkPage = await newPageInContext(context);
+
+    const results = [];
+    if (profiles && profiles.length) {
+      for (const u of profiles) {
+        await throttle.reserve("linkedin.com", "ACCEPTANCE_CHECK");
+        const r = await checkConnectedStatus(checkPage, u);
+        results.push(r);
+        if (r.ok && r.status === "connected") {
+          // (No side effects here; backend will move lead to Journey Navigators & enqueue message)
+        }
+        throttle.success("linkedin.com");
+        await sleep(within(1200, 2500));
+      }
+    } else {
+      // If no explicit profiles passed, we just noop-success — backend can use this as a timer tick.
+    }
+
+    try { await checkPage.close().catch(()=>{}); } catch {}
+    await browser.close().catch(()=>{});
+    return { ok: true, scanned: results.length, windowHours, results };
+  } catch (e) {
+    try { await checkPage?.close()?.catch(()=>{}); } catch {}
+    try { await browser?.close(); } catch {}
+    throw new Error(`ACCEPTANCE_SCAN failed: ${e.message}`);
+  }
+}
+
+async function handleCheckConnected(job) {
+  const p = job?.payload || {};
+  const userId = p.userId || "default";
+  const profileUrl = p.profileUrl;
+  if (!profileUrl) throw new Error("payload.profileUrl required");
+
+  if (SOFT_MODE) {
+    return { mode: "soft", profileUrl, status: "unknown", at: new Date().toISOString() };
+  }
+
+  const userStatePath = statePathForUser(userId);
+  let browser, context, page;
+  try {
+    ({ browser, context, page } = await createBrowserContext({ headless: HEADLESS, userStatePath }));
+    const auth = await ensureAuthenticated(context, page, userStatePath);
+    if (!auth.ok) {
+      await browser.close().catch(()=>{});
+      return { ok: false, profileUrl, status: "auth_failed" };
+    }
+    await feedWarmup(page);
+    const result = await checkConnectedStatus(page, profileUrl);
+    await browser.close().catch(()=>{});
+    return result;
+  } catch (e) {
+    try { await browser?.close(); } catch {}
+    throw new Error(`CHECK_CONNECTED failed: ${e.message}`);
   }
 }
 
 // ---------- Job loop ----------
 async function processOne() {
   let next;
-  try { next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE"] }); }
+  try { next = await apiPost("/jobs/next", { types: ["AUTH_CHECK", "SEND_CONNECTION", "SEND_MESSAGE", "ACCEPTANCE_SCAN", "CHECK_CONNECTED"] }); }
   catch (e) { logFetchError("jobs/next", e); return; }
   const job = next?.job; if (!job) return;
 
   try {
     let result = null;
     switch (job.type) {
-      case "AUTH_CHECK":      result = await handleAuthCheck(job); break;
-      case "SEND_CONNECTION": result = await handleSendConnection(job); break;
-      case "SEND_MESSAGE":    result = await handleSendMessage(job); break;
+      case "AUTH_CHECK":       result = await handleAuthCheck(job); break;
+      case "SEND_CONNECTION":  result = await handleSendConnection(job); break;
+      case "SEND_MESSAGE":     result = await handleSendMessage(job); break;
+      case "ACCEPTANCE_SCAN":  result = await handleAcceptanceScan(job); break;
+      case "CHECK_CONNECTED":  result = await handleCheckConnected(job); break;
       default: result = { note: `Unhandled job type: ${job.type}` }; break;
     }
     try {
@@ -1012,14 +1252,22 @@ async function processOne() {
       console.log("[worker] Job", job.id, "done:", result?.message || result?.details || result?.actionTaken || result?.note || "ok");
     } catch (e) { logFetchError(`jobs/${job.id}/complete`, e); }
   } catch (e) {
-    console.error("[worker] Job", job?.id, "failed:", e.message);
-    try { await apiPost(`/jobs/${job.id}/fail`, { error: e.message, requeue: false, delayMs: 0 }); }
-    catch (e2) { logFetchError(`jobs/${job.id}/fail`, e2); }
+    const soft = e && e._softDefer;
+    console.error("[worker] Job", job?.id, soft ? "soft-defer:" : "failed:", soft ? e.msg : e.message);
+    try {
+      await apiPost(`/jobs/${job.id}/fail`, {
+        error: soft ? e.msg : e.message,
+        requeue: !!soft,
+        delayMs: soft ? (e.requeueMs || REQUEUE_OUTSIDE_WINDOW_MS) : 0
+      });
+    } catch (e2) { logFetchError(`jobs/${job.id}/fail`, e2); }
   }
 }
 
 async function mainLoop() {
   console.log("[worker] starting.", `API_BASE=${API_BASE}`, `Headless: ${HEADLESS}`, `SlowMo: ${SLOWMO_MS}ms`, `Soft mode: ${SOFT_MODE}`);
+  console.log("[worker] window:", `${START_TIME_IST} + ${ACTIVE_WINDOW_HOURS}h`, "days:", ACTIVE_DAYS.join(","));
+  console.log("[worker] caps:", `invites=${MAX_INVITES_PER_DAY} messages=${MAX_MESSAGES_PER_DAY} enforce=${ENFORCE_DAILY_CAPS}`);
   if (!WORKER_SHARED_SECRET) console.error("[worker] ERROR: WORKER_SHARED_SECRET is empty. Set it on both backend and worker!");
   try { const stats = await apiGet("/jobs/stats"); console.log("[worker] API OK. Stats:", stats?.counts || stats); }
   catch (e) { logFetchError("jobs/stats (startup)", e); }
